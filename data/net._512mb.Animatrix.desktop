@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Animatrix
+Comment=Create profiles and control the ASUS AniMe Matrix
+Exec=animatrix
+Icon=net._512mb.Animatrix
+Terminal=false
+Categories=Settings;
+Keywords=ASUS;ROG;AniMe;Matrix;LED;
+StartupNotify=true

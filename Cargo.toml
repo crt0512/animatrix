@@ -1,0 +1,46 @@
+[package]
+name = "animatrix"
+version = "0.7.0"
+edition = "2024"
+description = "GTK4 profile manager for the ASUS ROG AniMe Matrix"
+license = "MIT"
+repository = "https://github.com/crt0512/animatrix"
+
+[features]
+default = ["gui", "tray"]
+gui = ["dep:gtk"]
+tray = ["dep:ksni", "dep:resvg", "dep:async-channel"]
+
+[dependencies]
+ab_glyph = "0.2.32"
+async-channel = { version = "2.5", optional = true }
+anyhow = "1.0.104"
+chrono = { version = "0.4.45", features = ["serde"] }
+directories = "6.0.0"
+image = { version = "0.25.9", default-features = false, features = ["gif", "png"] }
+imageproc = "0.25.0"
+ksni = { version = "0.3.6", optional = true, default-features = false, features = ["async-io", "blocking"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.151"
+gtk = { package = "gtk4", version = "0.10.0", optional = true, features = ["v4_10"] }
+zbus = { version = "5.13", default-features = false, features = ["blocking-api", "async-io"] }
+gif = "0.14"
+resvg = { version = "0.48.1", default-features = false, optional = true }
+
+[dev-dependencies]
+tempfile = "3.23.0"
+
+[package.metadata.deb]
+maintainer = "crt <crt@512mb.net>"
+copyright = "2026, Animatrix contributors"
+extended-description = "A GTK4 desktop and tray application for creating profiles and controlling the ASUS ROG AniMe Matrix through asusctl."
+depends = "$auto, asusctl, fonts-dejavu-core, libgtk-4-1"
+section = "utils"
+priority = "optional"
+assets = [
+  ["target/release/animatrix", "usr/bin/", "755"],
+  ["data/net._512mb.Animatrix.desktop", "usr/share/applications/", "644"],
+  ["data/net._512mb.Animatrix.png", "usr/share/icons/hicolor/64x64/apps/", "644"],
+  ["data/animatrix.service", "usr/lib/systemd/user/", "644"],
+  ["data/gifs/**/*.gif", "usr/share/animatrix/gifs/", "644"],
+]
