@@ -9,7 +9,7 @@ mod ui;
 fn main() -> anyhow::Result<()> {
     use std::sync::{Arc, Mutex};
 
-    use animatrix::{ConfigStore, EngineHandle};
+    use animatrix::{Autostart, ConfigStore, EngineHandle};
 
     // GTK rejects options it does not know, so take ours out first.
     let (minimized, args): (Vec<String>, Vec<String>) =
@@ -21,6 +21,11 @@ fn main() -> anyhow::Result<()> {
     let store = ConfigStore::discover()?;
     let config = store.load()?;
     store.save(&config)?;
+    if config.autostart {
+        if let Err(error) = Autostart::discover().and_then(|autostart| autostart.ensure()) {
+            eprintln!("animatrix: failed to install the login autostart entry: {error:#}");
+        }
+    }
     let shared = Arc::new(Mutex::new(config));
     let engine = EngineHandle::start(Arc::clone(&shared));
     ui::run(shared, store, engine, &args, !minimized.is_empty());

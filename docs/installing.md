@@ -60,6 +60,14 @@ systemctl --user enable --now animatrix.service
 
 `make install` uses `/usr/local` instead of `/usr`.
 
+## Starting at login
+
+`animatrix.service` is tied to `graphical-session.target`, which only systemd-managed sessions (GNOME, Plasma) start. Cinnamon, XFCE and MATE never start it, so the enabled service alone does not run there.
+
+So on every launch Animatrix also writes `~/.config/autostart/animatrix.desktop`, which every desktop runs at login. It starts the service, or runs `animatrix --minimized` directly when the unit is not installed. Where the service is already running, the entry does nothing.
+
+**Settings → Start at login** shows whether the entry is installed. **Reinstall** writes it again; **Uninstall** removes it and stops later launches from putting it back. `make uninstall` does not remove this per-user file.
+
 ## Running from the source tree
 
 ```sh

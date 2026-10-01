@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use animatrix::{
-    AppConfig, BatteryStyle, ConfigStore, DisplayProfile, Element, ElementKind, EngineCommand,
+    AppConfig, Autostart, BatteryStyle, ConfigStore, DisplayProfile, Element, ElementKind, EngineCommand,
     EngineHandle, GifLayout, GifLoop, MatrixGeometry, OverlayColor, DevicePolicy, ProfileTriggers, Trigger,
     ScrollDirection, TextMode, Transition, TurnLength, WindowState,
 };
@@ -1279,6 +1279,8 @@ fn settings_page(context: UiContext) -> gtk::ScrolledWindow {
     });
     content.append(&menu_on_left);
     content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    content.append(&autostart_row(&context));
+    content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
     let tilt = gtk::SpinButton::with_range(-2.0, 2.0, 0.05);
     tilt.set_digits(2);
@@ -1348,6 +1350,57 @@ fn settings_page(context: UiContext) -> gtk::ScrolledWindow {
     });
     content.append(&apply);
     gtk::ScrolledWindow::builder().child(&content).build()
+}
+
+/// "Start at login": the autostart entry's state, with buttons to write it
+/// again or remove it. Removing also stops launches from putting it back.
+fn autostart_row(context: &UiContext) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let status = gtk::Label::builder().xalign(0.0).hexpand(true).wrap(true).build();
+    let install = gtk::Button::new();
+    let uninstall = gtk::Button::with_label("Uninstall");
+    row.append(&gtk::Label::new(Some("Start at login")));
+    row.append(&status);
+    row.append(&install);
+    row.append(&uninstall);
+
+    let autostart = match Autostart::discover() {
+        Ok(autostart) => autostart,
+        Err(error) => {
+            status.set_text(&format!("{error:#}"));
+            install.set_label("Install");
+            install.set_sensitive(false);
+            uninstall.set_sensitive(false);
+            return row;
+        }
+    };
+    install.set_tooltip_text(Some(&format!("Writes {}", autostart.path().display())));
+    let show = {
+        let (status, install, uninstall, autostart) = (status.clone(), install.clone(), uninstall.clone(), autostart.clone());
+        move |error: Option<anyhow::Error>| {
+            let installed = autostart.is_installed();
+            match error {
+                Some(error) => status.set_text(&format!("{error:#}")),
+                None if installed => status.set_text("Installed"),
+                None => status.set_text("Not installed"),
+            }
+            install.set_label(if installed { "Reinstall" } else { "Install" });
+            uninstall.set_sensitive(installed);
+        }
+    };
+    show(None);
+
+    let (install_context, install_autostart, install_show) = (context.clone(), autostart.clone(), show.clone());
+    install.connect_clicked(move |_| {
+        mutate_config(&install_context, false, |config| config.autostart = true);
+        install_show(install_autostart.install().err());
+    });
+    let uninstall_context = context.clone();
+    uninstall.connect_clicked(move |_| {
+        mutate_config(&uninstall_context, false, |config| config.autostart = false);
+        show(autostart.uninstall().err());
+    });
+    row
 }
 
 fn entry_row(grid: &gtk::Grid, row: i32, label: &str, value: &str) -> gtk::Entry {

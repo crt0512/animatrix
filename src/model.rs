@@ -120,6 +120,10 @@ pub struct AppConfig {
     pub preview_row_height: f32,
     #[serde(default)]
     pub triggers: ProfileTriggers,
+    /// Keep the login autostart entry installed; off once the user removes
+    /// it on the Settings tab, so a launch does not put it back.
+    #[serde(default = "default_true")]
+    pub autostart: bool,
 }
 
 /// Main window geometry, restored on the next open. `width` and `height`
@@ -303,6 +307,7 @@ impl Default for AppConfig {
             preview_height: default_preview_height(),
             preview_row_height: default_preview_row_height(),
             triggers: ProfileTriggers::default(),
+            autostart: true,
         }
     }
 }
