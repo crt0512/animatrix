@@ -1,6 +1,6 @@
 [package]
 name = "animatrix"
-version = "0.7.3"
+version = "0.7.6"
 edition = "2024"
 description = "GTK4 profile manager for the ASUS ROG AniMe Matrix"
 license = "MIT"
