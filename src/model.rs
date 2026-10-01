@@ -93,6 +93,10 @@ pub struct AppConfig {
     /// Draw the black tray icons in white, for dark panels.
     #[serde(default)]
     pub invert_tray_icon: bool,
+    /// Left-clicking the tray icon opens the window instead of toggling
+    /// the light show.
+    #[serde(default)]
+    pub tray_click_opens_window: bool,
     #[serde(default)]
     pub triggers: ProfileTriggers,
 }
@@ -154,6 +158,7 @@ impl Default for AppConfig {
             profiles: vec![profile],
             policy: DevicePolicy::default(),
             invert_tray_icon: false,
+            tray_click_opens_window: false,
             triggers: ProfileTriggers::default(),
         }
     }

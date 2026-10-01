@@ -52,7 +52,7 @@ The **↑ / ↓** buttons on an element card move it within its profile. The ord
 
 ## Tray
 
-The tray menu lists all profiles and switches between them. Left-clicking the tray icon turns the light show on or off; see [Tray](device.md#tray).
+The tray menu lists all profiles and switches between them. Left-clicking the tray icon turns the light show on or off (or opens the window, if you choose); see [Tray](device.md#tray).
 
 ## Older configurations
 

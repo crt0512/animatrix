@@ -40,7 +40,7 @@ The **Light show** switch in the window header (and the tray) turns Animatrix's 
 
 ## Tray
 
-- **Left-click** the tray icon to turn the light show on or off. The icon shows the current state.
+- **Left-click** the tray icon to turn the light show on or off. The icon shows the current state. To open the window on a click instead, tick **Clicking the tray icon opens the window** at the top of the Device behavior page.
 - **Right-click** for the menu: light show on/off, switch profile, open the window, quit.
 - The icons are black. On a dark panel tick **Invert tray icon colors** at the top of the Device behavior page to draw them white; this applies immediately.
 - Closing the window keeps Animatrix running in the tray. Use *Quit* in the tray menu to exit.

@@ -44,8 +44,14 @@ impl ksni::Tray for AnimatrixTray {
         tray_icons(enabled, inverted)
     }
 
-    /// Left click toggles the light show.
+    /// Left click toggles the light show, or opens the window if the user
+    /// chose that instead.
     fn activate(&mut self, _x: i32, _y: i32) {
+        let opens_window = self.config.lock().map(|config| config.tray_click_opens_window).unwrap_or(false);
+        if opens_window {
+            let _ = self.ui.send_blocking(UiCommand::Show);
+            return;
+        }
         if let Ok(mut config) = self.config.lock() {
             config.enabled = !config.enabled;
         }

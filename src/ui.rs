@@ -25,7 +25,9 @@ struct UiContext {
 
 const APP_ID: &str = "net._512mb.Animatrix";
 
-pub fn run(config: Arc<Mutex<AppConfig>>, store: ConfigStore, engine: EngineHandle) {
+/// With `minimized`, the first activation opens no window; the tray or a
+/// second launch opens it later.
+pub fn run(config: Arc<Mutex<AppConfig>>, store: ConfigStore, engine: EngineHandle, args: &[String], minimized: bool) {
     let app = gtk::Application::builder()
         .application_id(APP_ID)
         .build();
@@ -42,6 +44,7 @@ pub fn run(config: Arc<Mutex<AppConfig>>, store: ConfigStore, engine: EngineHand
     );
 
     let activate_context = context.clone();
+    let start_hidden = std::cell::Cell::new(minimized);
     app.connect_startup(|_| {
         // Installed builds find the icon in hicolor; source builds use data/.
         #[cfg(debug_assertions)]
@@ -53,6 +56,9 @@ pub fn run(config: Arc<Mutex<AppConfig>>, store: ConfigStore, engine: EngineHand
     app.connect_activate(move |app| {
         if let Some(window) = app.active_window() {
             window.present();
+            return;
+        }
+        if start_hidden.replace(false) {
             return;
         }
         build_window(app, activate_context.clone()).present();
@@ -73,7 +79,7 @@ pub fn run(config: Arc<Mutex<AppConfig>>, store: ConfigStore, engine: EngineHand
     }
 
     let _hold = app.hold();
-    app.run();
+    app.run_with_args(args);
     context.engine.send(EngineCommand::Shutdown);
 }
 
@@ -229,11 +235,13 @@ fn rebuild_profiles(content: &gtk::Box, context: &UiContext) {
     }
 }
 
-/// "Switch profile automatically": one dropdown per power/lid change.
+/// "Switch profile automatically": one dropdown per power/lid change, two
+/// to a row while they fit side by side and one per row when they do not.
 fn triggers_section(context: &UiContext, snapshot: &AppConfig) -> gtk::Frame {
     let frame = gtk::Frame::new(Some("Switch profile automatically"));
-    let grid = gtk::Grid::builder().column_spacing(12).row_spacing(8).margin_top(8).margin_bottom(8)
-        .margin_start(8).margin_end(8).build();
+    let flow = gtk::FlowBox::builder().min_children_per_line(1).max_children_per_line(2).homogeneous(true)
+        .selection_mode(gtk::SelectionMode::None).column_spacing(12).row_spacing(8).margin_top(8)
+        .margin_bottom(8).margin_start(8).margin_end(8).build();
     let mut names = vec!["Do nothing".to_owned()];
     names.extend(snapshot.profiles.iter().map(|profile| profile.name.clone()));
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -246,10 +254,17 @@ fn triggers_section(context: &UiContext, snapshot: &AppConfig) -> gtk::Frame {
         ("When the lid closes", |triggers| &mut triggers.lid_closed),
         ("When the lid opens", |triggers| &mut triggers.lid_opened),
     ];
-    for (row, (label, slot)) in rows.into_iter().enumerate() {
+    for (label, slot) in rows {
         let mut current = snapshot.triggers.clone();
         let chosen = slot(&mut current).as_ref().and_then(|id| ids.iter().position(|known| known == id));
-        let dropdown = dropdown_row(&grid, row as i32, label, &names, chosen.map_or(0, |index| index + 1));
+        let dropdown = gtk::DropDown::from_strings(&names);
+        dropdown.set_selected(chosen.map_or(0, |index| index + 1) as u32);
+        let item = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        item.append(&gtk::Label::builder().label(label).xalign(0.0).build());
+        item.append(&dropdown);
+        // Only the dropdown inside takes focus, not the flow box cell.
+        let cell = gtk::FlowBoxChild::builder().child(&item).focusable(false).build();
+        flow.append(&cell);
         let (trigger_context, trigger_ids) = (context.clone(), ids.clone());
         dropdown.connect_selected_notify(move |dropdown| {
             // Index 0 is "Do nothing", the rest follow the profile list.
@@ -257,7 +272,7 @@ fn triggers_section(context: &UiContext, snapshot: &AppConfig) -> gtk::Frame {
             mutate_config(&trigger_context, false, |config| *slot(&mut config.triggers) = id);
         });
     }
-    frame.set_child(Some(&grid));
+    frame.set_child(Some(&flow));
     frame
 }
 
@@ -744,6 +759,15 @@ fn policy_page(context: UiContext) -> gtk::ScrolledWindow {
         mutate_config(&invert_context, false, |config| config.invert_tray_icon = value);
     });
     content.append(&invert);
+    let click_opens = gtk::CheckButton::with_label("Clicking the tray icon opens the window");
+    click_opens.set_tooltip_text(Some("Otherwise a click turns the light show on or off"));
+    click_opens.set_active(context.config.lock().map(|config| config.tray_click_opens_window).unwrap_or(false));
+    let click_context = context.clone();
+    click_opens.connect_toggled(move |check| {
+        let value = check.is_active();
+        mutate_config(&click_context, false, |config| config.tray_click_opens_window = value);
+    });
+    content.append(&click_opens);
     content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
     for widget in [&unplugged, &suspended, &lid] { content.append(widget); }
