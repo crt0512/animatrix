@@ -7,7 +7,7 @@ use std::time::Duration;
 use animatrix::{
     AppConfig, BatteryStyle, ConfigStore, DisplayProfile, Element, ElementKind, EngineCommand,
     EngineHandle, GifLayout, GifLoop, MatrixGeometry, OverlayColor, ProfileTriggers,
-    ScrollDirection, TextMode,
+    ScrollDirection, TextMode, WindowState,
 };
 use animatrix::model::{MAX_BLACK_LEVEL, MAX_CONTRAST, MAX_FPS, MAX_GIF_BRIGHTNESS, MAX_OUTLINE, MAX_SCROLL_PAUSE, MAX_SPRITE_SIZE, MIN_CONTRAST};
 use gtk::glib;
@@ -84,15 +84,27 @@ pub fn run(config: Arc<Mutex<AppConfig>>, store: ConfigStore, engine: EngineHand
 }
 
 fn build_window(app: &gtk::Application, context: UiContext) -> gtk::ApplicationWindow {
+    let saved = context.config.lock().ok().and_then(|config| config.window);
     let window = gtk::ApplicationWindow::builder()
         .application(app)
         .title("Animatrix")
-        .default_width(900)
-        .default_height(680)
+        .default_width(saved.map_or(900, |state| state.width))
+        .default_height(saved.map_or(680, |state| state.height))
+        .maximized(saved.is_some_and(|state| state.maximized))
         .build();
-    window.connect_close_request(|window| {
+    let close_context = context.clone();
+    window.connect_close_request(move |window| {
+        remember_window_size(&close_context, window);
         window.set_visible(false);
         glib::Propagation::Stop
+    });
+    // Quitting from the tray skips the close request.
+    let quit_context = context.clone();
+    let quit_window = window.downgrade();
+    app.connect_shutdown(move |_| {
+        if let Some(window) = quit_window.upgrade().filter(|window| window.is_visible()) {
+            remember_window_size(&quit_context, &window);
+        }
     });
 
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -759,15 +771,17 @@ fn policy_page(context: UiContext) -> gtk::ScrolledWindow {
         mutate_config(&invert_context, false, |config| config.invert_tray_icon = value);
     });
     content.append(&invert);
-    let click_opens = gtk::CheckButton::with_label("Clicking the tray icon opens the window");
-    click_opens.set_tooltip_text(Some("Otherwise a click turns the light show on or off"));
-    click_opens.set_active(context.config.lock().map(|config| config.tray_click_opens_window).unwrap_or(false));
-    let click_context = context.clone();
-    click_opens.connect_toggled(move |check| {
+    let menu_on_left = gtk::CheckButton::with_label("Swap tray clicks (left click opens the menu)");
+    menu_on_left.set_tooltip_text(Some(
+        "Middle click then turns the light show on or off. Right click keeps opening the menu; the panel decides that.",
+    ));
+    menu_on_left.set_active(context.config.lock().map(|config| config.tray_menu_on_left_click).unwrap_or(false));
+    let menu_context = context.clone();
+    menu_on_left.connect_toggled(move |check| {
         let value = check.is_active();
-        mutate_config(&click_context, false, |config| config.tray_click_opens_window = value);
+        mutate_config(&menu_context, false, |config| config.tray_menu_on_left_click = value);
     });
-    content.append(&click_opens);
+    content.append(&menu_on_left);
     content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
     for widget in [&unplugged, &suspended, &lid] { content.append(widget); }
@@ -1043,6 +1057,24 @@ where
             update(profile);
         }
     });
+}
+
+/// Saves the window size without refreshing the engine; nothing on the
+/// panel depends on it.
+fn remember_window_size(context: &UiContext, window: &gtk::ApplicationWindow) {
+    // While maximized, the default size still holds the unmaximized one.
+    let (width, height) = window.default_size();
+    let state = WindowState { width, height, maximized: window.is_maximized() };
+    let snapshot = match context.config.lock() {
+        Ok(mut config) if config.window != Some(state) => {
+            config.window = Some(state);
+            config.clone()
+        }
+        _ => return,
+    };
+    if let Err(error) = context.store.save(&snapshot) {
+        eprintln!("animatrix: failed to save window size: {error:#}");
+    }
 }
 
 fn mutate_config<F>(context: &UiContext, policy_changed: bool, update: F)

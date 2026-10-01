@@ -9,7 +9,7 @@ A Linux desktop and tray app for the ASUS ROG **AniMe Matrix** LED panel on the 
 
 - **Profiles** made of layered elements, or elements shown one after another.
 - **Clock**, **text** (scroll, bounce, blink, pulse, typewriter, wave), **GIF** (fit, stretch, or animated like text), **flashlight**, and **battery** (five styles) elements.
-- **Tray icon**: left-click toggles the light show (or opens the window); the menu switches profiles.
+- **Tray icon**: left-click toggles the light show; the menu switches profiles.
 - **Device behaviour**: brightness, off when unplugged/suspended/lid closed (optionally after a delay), built-in ASUS animations.
 - Frames go straight to `asusd` over D-Bus, fast enough for ~30 FPS.
 

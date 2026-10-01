@@ -12,5 +12,5 @@ pub use config::ConfigStore;
 pub use engine::{EngineCommand, EngineHandle};
 pub use model::{
 	AppConfig, BatteryStyle, ContentArea, CycleSettings, DevicePolicy, DisplayProfile, Element, GifLayout, GifLoop, MatrixGeometry, MatrixModel, ElementKind, OverlayColor, ProfileTriggers,
-	ScrollDirection, TextMode,
+	ScrollDirection, TextMode, WindowState,
 };

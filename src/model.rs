@@ -93,12 +93,25 @@ pub struct AppConfig {
     /// Draw the black tray icons in white, for dark panels.
     #[serde(default)]
     pub invert_tray_icon: bool,
-    /// Left-clicking the tray icon opens the window instead of toggling
-    /// the light show.
+    /// Left click opens the tray menu and middle click toggles the light
+    /// show, instead of the other way round.
     #[serde(default)]
-    pub tray_click_opens_window: bool,
+    pub tray_menu_on_left_click: bool,
+    /// Main window size when it was last closed; `None` until then.
+    #[serde(default)]
+    pub window: Option<WindowState>,
     #[serde(default)]
     pub triggers: ProfileTriggers,
+}
+
+/// Main window geometry, restored on the next open. `width` and `height`
+/// are the unmaximized size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowState {
+    pub width: i32,
+    pub height: i32,
+    #[serde(default)]
+    pub maximized: bool,
 }
 
 /// Profiles to switch to when the power or lid state changes; `None` does
@@ -158,7 +171,8 @@ impl Default for AppConfig {
             profiles: vec![profile],
             policy: DevicePolicy::default(),
             invert_tray_icon: false,
-            tray_click_opens_window: false,
+            tray_menu_on_left_click: false,
+            window: None,
             triggers: ProfileTriggers::default(),
         }
     }

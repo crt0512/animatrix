@@ -9,14 +9,24 @@ pub enum UiCommand {
     Quit,
 }
 
-struct AnimatrixTray {
+/// `MENU_ON_LEFT` is fixed when the tray is registered (ksni reads it as a
+/// constant), so changing the setting re-registers the tray.
+#[derive(Clone)]
+struct AnimatrixTray<const MENU_ON_LEFT: bool> {
     config: Arc<Mutex<AppConfig>>,
     store: ConfigStore,
     engine: EngineHandle,
     ui: async_channel::Sender<UiCommand>,
 }
 
-impl AnimatrixTray {
+impl<const MENU_ON_LEFT: bool> AnimatrixTray<MENU_ON_LEFT> {
+    fn toggle(&self) {
+        if let Ok(mut config) = self.config.lock() {
+            config.enabled = !config.enabled;
+        }
+        self.save();
+    }
+
     fn save(&self) {
         let snapshot = self.config.lock().ok().map(|config| config.clone());
         if let Some(config) = snapshot {
@@ -28,7 +38,9 @@ impl AnimatrixTray {
     }
 }
 
-impl ksni::Tray for AnimatrixTray {
+impl<const MENU_ON_LEFT: bool> ksni::Tray for AnimatrixTray<MENU_ON_LEFT> {
+    const MENU_ON_ACTIVATE: bool = MENU_ON_LEFT;
+
     fn id(&self) -> String {
         "net._512mb.Animatrix".into()
     }
@@ -44,18 +56,15 @@ impl ksni::Tray for AnimatrixTray {
         tray_icons(enabled, inverted)
     }
 
-    /// Left click toggles the light show, or opens the window if the user
-    /// chose that instead.
+    /// Left click toggles the light show, unless it opens the menu.
     fn activate(&mut self, _x: i32, _y: i32) {
-        let opens_window = self.config.lock().map(|config| config.tray_click_opens_window).unwrap_or(false);
-        if opens_window {
-            let _ = self.ui.send_blocking(UiCommand::Show);
-            return;
-        }
-        if let Ok(mut config) = self.config.lock() {
-            config.enabled = !config.enabled;
-        }
-        self.save();
+        self.toggle();
+    }
+
+    /// Middle click toggles the light show too, so it stays one click away
+    /// when left click opens the menu.
+    fn secondary_activate(&mut self, _x: i32, _y: i32) {
+        self.toggle();
     }
 
     fn title(&self) -> String {
@@ -84,12 +93,7 @@ impl ksni::Tray for AnimatrixTray {
             CheckmarkItem {
                 label: "Light show enabled".into(),
                 checked: snapshot.enabled,
-                activate: Box::new(|this: &mut Self| {
-                    if let Ok(mut config) = this.config.lock() {
-                        config.enabled = !config.enabled;
-                    }
-                    this.save();
-                }),
+                activate: Box::new(|this: &mut Self| this.toggle()),
                 ..Default::default()
             }
             .into(),
@@ -173,6 +177,37 @@ fn tray_state(config: &AppConfig) -> (bool, bool, Option<String>, Vec<String>) {
     )
 }
 
+/// The registered tray, in whichever click layout it was built with.
+enum Running {
+    ToggleOnLeft(ksni::blocking::Handle<AnimatrixTray<false>>),
+    MenuOnLeft(ksni::blocking::Handle<AnimatrixTray<true>>),
+}
+
+impl Running {
+    fn spawn(tray: &AnimatrixTray<false>, menu_on_left: bool) -> Result<Self, ksni::Error> {
+        Ok(if menu_on_left {
+            let AnimatrixTray { config, store, engine, ui } = tray.clone();
+            Self::MenuOnLeft(AnimatrixTray::<true> { config, store, engine, ui }.spawn()?)
+        } else {
+            Self::ToggleOnLeft(tray.clone().spawn()?)
+        })
+    }
+
+    fn update(&self) {
+        match self {
+            Self::ToggleOnLeft(handle) => { handle.update(|_| {}); }
+            Self::MenuOnLeft(handle) => { handle.update(|_| {}); }
+        }
+    }
+
+    fn shutdown(self) {
+        match self {
+            Self::ToggleOnLeft(handle) => handle.shutdown().wait(),
+            Self::MenuOnLeft(handle) => handle.shutdown().wait(),
+        }
+    }
+}
+
 pub fn start(
     config: Arc<Mutex<AppConfig>>,
     store: ConfigStore,
@@ -183,8 +218,12 @@ pub fn start(
         let watched = Arc::clone(&config);
         let changes = engine.subscribe();
         let tray = AnimatrixTray { config, store, engine, ui };
-        let handle = match tray.spawn() {
-            Ok(handle) => handle,
+        let menu_on_left = |config: &Arc<Mutex<AppConfig>>| {
+            config.lock().map(|config| config.tray_menu_on_left_click).unwrap_or(false)
+        };
+        let mut layout = menu_on_left(&watched);
+        let mut running = match Running::spawn(&tray, layout) {
+            Ok(running) => running,
             Err(error) => {
                 eprintln!("animatrix: tray unavailable: {error}");
                 return;
@@ -195,9 +234,22 @@ pub fn start(
         // those instead of polling.
         let mut shown = watched.lock().ok().map(|config| tray_state(&config));
         while changes.recv().is_ok() {
+            if menu_on_left(&watched) != layout {
+                layout = !layout;
+                running.shutdown();
+                running = match Running::spawn(&tray, layout) {
+                    Ok(running) => running,
+                    Err(error) => {
+                        eprintln!("animatrix: tray unavailable: {error}");
+                        return;
+                    }
+                };
+                shown = watched.lock().ok().map(|config| tray_state(&config));
+                continue;
+            }
             let state = watched.lock().ok().map(|config| tray_state(&config));
             if state.is_some() && state != shown {
-                handle.update(|_| {});
+                running.update();
                 shown = state;
             }
         }
