@@ -8,7 +8,7 @@ A Linux desktop and tray app for the ASUS ROG **AniMe Matrix** LED panel on the 
 ## Features
 
 - **Profiles** made of layered elements, or elements shown one after another.
-- **Clock**, **text** (scroll, bounce, blink, pulse, typewriter, wave), **GIF** (fit, stretch, or animated like text), **flashlight**, and **battery** (five styles) elements.
+- **Clock**, **text** (scroll, infinite scroll, bounce, blink, pulse, typewriter, wave), **GIF/Image** (GIF, PNG, or JPEG; as is, fit, stretch, scaled, or animated like text), **flashlight**, and **battery** (five styles) elements.
 - **Tray icon**: left-click toggles the light show; the menu switches profiles.
 - **Scripting**: `animatrix --profile NAME` or D-Bus actions switch profiles from scripts; see [docs/scripting.md](docs/scripting.md).
 - **Device behaviour**: brightness cap in the header, off when unplugged/suspended/lid closed (optionally after a delay), profile switching on power and lid changes (optionally switching back after a while), built-in ASUS animations.

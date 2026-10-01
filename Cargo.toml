@@ -1,6 +1,6 @@
 [package]
 name = "animatrix"
-version = "0.8.0"
+version = "0.8.8"
 edition = "2024"
 description = "GTK4 profile manager for the ASUS ROG AniMe Matrix"
 license = "MIT"
@@ -17,7 +17,7 @@ async-channel = { version = "2.5", optional = true }
 anyhow = "1.0.104"
 chrono = { version = "0.4.45", features = ["serde"] }
 directories = "6.0.0"
-image = { version = "0.25.9", default-features = false, features = ["gif", "png"] }
+image = { version = "0.25.9", default-features = false, features = ["gif", "png", "jpeg"] }
 imageproc = "0.25.0"
 ksni = { version = "0.3.6", optional = true, default-features = false, features = ["async-io", "blocking"] }
 serde = { version = "1.0.228", features = ["derive"] }

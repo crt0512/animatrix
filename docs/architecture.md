@@ -44,11 +44,13 @@ Animatrix is event-driven and does not poll when there is nothing to do.
 
 Each visible element reports when it can next look different: a clock at the next second or minute boundary, animations at their FPS, a GIF at its next frame, a still battery gauge every 5 seconds, and static text or a flashlight never. The engine sleeps until the soonest of those and only sends a frame when something actually changed. A clock without seconds therefore costs one wake-up per minute.
 
+Animations keep to a fixed frame grid: each frame is drawn for the exact time its frame starts, and the wait for the next one is measured from when the current one was due, not from when it finished sending. Scrolling text at the same FPS as its speed therefore moves exactly one pixel every frame, however long drawing and sending took or how early the engine woke up.
+
 Other reasons to wake up:
 
 - **Settings changes** from the window or tray wake the engine immediately.
 - **Sensors** are read only if a setting needs them: the lid for the [lid close delay](device.md#lid-close-delay) or lid triggers, mains power for *Unless plugged in* or power triggers; both for the *lid and plugged in* triggers. Then they are checked once a second, which also runs pending [switch-backs](profiles.md#switching-back).
-- **Element cycling** checks for the next turn every 200 ms.
+- **Element cycling** wakes once per turn, right as the next element is due; a profile that does not repeat stops waking once its last element is reached.
 - A frame that could not be sent (for example while `asusd` restarts) is retried after a second.
 
 With the light show off and no [profile triggers](profiles.md#switching-automatically), the engine sleeps until you change something. The tray only updates when the engine reports a change, and the window's status line only refreshes while the window is open. Fonts are loaded once and reused.

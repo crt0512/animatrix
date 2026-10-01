@@ -24,6 +24,9 @@ The **Device behavior** tab holds [Switch profile automatically](profiles.md#swi
 |-------------------------------------------|----------------------------------------------------------------------------------------------|
 | Invert tray icon colors                   | White tray icons for dark panels; applies immediately                                        |
 | Swap tray clicks                          | See [Tray](#tray); applies immediately                                                        |
+| Tilt compensation (pixels per row)        | How far elements with *Tilt compensation* lean, see [Elements](elements.md); applies immediately |
+| Preview row height                        | How tall a row of LEDs looks on the lid compared with a column's width (0.65 by default, 1 = square), so the [preview](#panel-preview) has the panel's proportions; applies immediately |
+| Profile switch fade                       | Seconds to fade the shown profile out, then the next one in, whenever the active profile changes (window, tray, trigger, switch-back, script); 0 switches at once. See [Profiles](profiles.md#switching-profiles) |
 | Enable built-in powersave animation       | ASUS's own animations when idle                                                              |
 | Boot / awake / sleep / shutdown animation | ASUS built-in animation for each state, by name as `asusctl anime set-builtins` expects them |
 
@@ -47,6 +50,14 @@ Unplugging while the lid is already closed starts the delay at that moment; plug
 Only the first row is left to `asusd` (its normal behaviour). For every other combination Animatrix switches off `asusd`'s own lid handling and watches the lid (`/proc/acpi/button/lid`) and mains power (`/sys/class/power_supply`) itself.
 
 If closing the lid suspends the laptop, the suspend setting takes over first.
+
+## Panel preview
+
+**Preview**, at the right of the status line at the bottom of the window, shows what the panel is displaying: every LED drawn where it sits, turned 45° the way the panel sits on the lid, with unlit LEDs faintly visible. It follows the panel live, including profile switches from triggers or [scripts](scripting.md), and goes dark with it.
+
+Drag the line above the preview up or down to resize it, between 60 and 480 pixels and at most three fifths of the window. Whether it is shown and its size are remembered.
+
+The preview only checks for new frames while it is shown and the window is open, and only redraws when the panel changed.
 
 ## Light show switch
 

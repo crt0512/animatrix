@@ -38,7 +38,33 @@ impl GifAnimation {
         Self::load(&resolved)
     }
 
+    /// Where [`Self::placed_on`] puts the GIF on `canvas`: left, top,
+    /// width, height (it may reach past the edges).
+    pub fn placed_rect(&self, layout: GifLayout, geometry: MatrixGeometry, canvas: MatrixGeometry, scale: f32) -> (i64, i64, usize, usize) {
+        let (panel_w, panel_h) = (geometry.width as usize, geometry.height as usize);
+        let (w, h) = match layout {
+            GifLayout::AsIs | GifLayout::Animate => (self.width, self.height),
+            GifLayout::Stretch => (panel_w, panel_h),
+            GifLayout::Fit => {
+                let scale = (panel_w as f64 / self.width as f64).min(panel_h as f64 / self.height as f64);
+                let fit = |size: usize| ((size as f64 * scale).round() as usize).max(1);
+                (fit(self.width), fit(self.height))
+            }
+        };
+        let scaled = |size: usize| ((size as f64 * f64::from(scale)).round() as usize).max(1);
+        let (w, h) = (scaled(w), scaled(h));
+        ((canvas.width as i64 - w as i64) / 2, (canvas.height as i64 - h as i64) / 2, w, h)
+    }
+
+    /// Loads a GIF, or a PNG or JPEG as a single still frame.
     pub fn load(path: &Path) -> Result<Self> {
+        let mut file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+        // By content, not name: a renamed file still opens.
+        let mut magic = [0u8; 4];
+        let is_gif = std::io::Read::read_exact(&mut file, &mut magic).is_ok() && magic[..3] == *b"GIF";
+        if !is_gif {
+            return Self::load_still(path);
+        }
         let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
         let mut options = gif::DecodeOptions::new();
         options.set_color_output(gif::ColorOutput::RGBA);
@@ -99,18 +125,25 @@ impl GifAnimation {
     /// `layout` and centred. `Animate` is placed like `AsIs`; use
     /// [`Self::sprite`] for it.
     pub fn placed(&self, index: usize, layout: GifLayout, geometry: MatrixGeometry) -> Vec<u8> {
-        let (canvas_w, canvas_h) = (geometry.width as usize, geometry.height as usize);
-        let (w, h) = match layout {
-            GifLayout::AsIs | GifLayout::Animate => (self.width, self.height),
-            GifLayout::Stretch => (canvas_w, canvas_h),
-            GifLayout::Fit => {
-                let scale = (canvas_w as f64 / self.width as f64).min(canvas_h as f64 / self.height as f64);
-                let fit = |size: usize| ((size as f64 * scale).round() as usize).max(1);
-                (fit(self.width), fit(self.height))
-            }
-        };
-        let frame = resample(self.frame(index), self.width, self.height, w, h);
-        let (left, top) = ((canvas_w as i64 - w as i64) / 2, (canvas_h as i64 - h as i64) / 2);
+        self.placed_on(index, layout, geometry, geometry, true, 1.0)
+    }
+
+    /// [`Self::placed`], sized for the panel `geometry` but centred on the
+    /// larger `canvas` around it, so nothing is cropped at the panel's edge.
+    /// `smooth` blends pixels when scaling; off picks the nearest one.
+    /// `scale` multiplies the size the layout picks.
+    pub fn placed_on(
+        &self,
+        index: usize,
+        layout: GifLayout,
+        geometry: MatrixGeometry,
+        canvas: MatrixGeometry,
+        smooth: bool,
+        scale: f32,
+    ) -> Vec<u8> {
+        let (canvas_w, canvas_h) = (canvas.width as usize, canvas.height as usize);
+        let (left, top, w, h) = self.placed_rect(layout, geometry, canvas, scale);
+        let frame = resample(self.frame(index), self.width, self.height, w, h, smooth);
         let mut canvas = vec![0u8; canvas_w * canvas_h];
         for (y, row) in frame.chunks(w).enumerate() {
             let cy = top + y as i64;
@@ -134,9 +167,9 @@ impl GifAnimation {
     }
 
     /// Frame `index` scaled to `height` pixels tall, for `GifLayout::Animate`.
-    pub fn sprite(&self, index: usize, height: u32) -> Sprite {
+    pub fn sprite(&self, index: usize, height: u32, smooth: bool) -> Sprite {
         let (width, height) = self.sprite_size(height);
-        let levels = resample(self.frame(index), self.width, self.height, width as usize, height as usize);
+        let levels = resample(self.frame(index), self.width, self.height, width as usize, height as usize, smooth);
         Sprite { width, height, levels }
     }
 
@@ -145,7 +178,9 @@ impl GifAnimation {
     pub fn index_at(&self, elapsed: Duration, fps: f32, looping: GifLoop) -> usize {
         let steps = self.steps(looping);
         if fps > 0.0 {
-            return self.step_frame((elapsed.as_secs_f64() * f64::from(fps)) as usize % steps);
+            // The nudge keeps a wake-up a hair short of a boundary in the
+            // frame it was meant for, matching the engine's frame grid.
+            return self.step_frame((elapsed.as_secs_f64() * f64::from(fps) + 1e-6) as usize % steps);
         }
         let mut remaining = elapsed.as_nanos() % self.cycle_duration(0.0, looping).as_nanos().max(1);
         for step in 0..steps {
@@ -186,18 +221,61 @@ impl GifAnimation {
         }
     }
 
+    /// How often a GIF's overlay animation steps: at the FPS override when
+    /// set, otherwise as fast as the GIF's quickest frame, at most 30 times
+    /// a second.
+    pub fn overlay_fps(&self, fps: f32) -> f64 {
+        if fps > 0.0 {
+            return f64::from(fps);
+        }
+        let quickest = self.delays.iter().copied().min().unwrap_or(MIN_FRAME);
+        (1.0 / quickest.as_secs_f64()).min(f64::from(crate::model::MAX_FPS))
+    }
+
+    /// A PNG or JPEG: its lightness is the LED brightness and transparent
+    /// areas stay dark.
+    fn load_still(path: &Path) -> Result<Self> {
+        let unreadable = || format!("{} is not a readable GIF, PNG, or JPEG", path.display());
+        // By content, like GIFs: the extension may say otherwise.
+        let picture = image::ImageReader::open(path)
+            .with_context(|| format!("failed to open {}", path.display()))?
+            .with_guessed_format()
+            .with_context(unreadable)?
+            .decode()
+            .with_context(unreadable)?
+            .to_luma_alpha8();
+        let (width, height) = (picture.width() as usize, picture.height() as usize);
+        anyhow::ensure!(width > 0 && height > 0, "{} is empty", path.display());
+        let levels = picture.pixels().map(|pixel| (u16::from(pixel.0[0]) * u16::from(pixel.0[1]) / 255) as u8).collect();
+        Ok(Self { width, height, frames: vec![levels], delays: vec![MIN_FRAME], total: MIN_FRAME })
+    }
+
     /// Whether there is more than one frame to show.
     pub fn is_animated(&self) -> bool {
         self.frames.len() > 1
     }
 
-    /// How often the engine must check for the next frame.
-    pub fn frame_interval(&self, fps: f32) -> Duration {
+    /// Time from `elapsed` until the next frame starts, plus a moment so the
+    /// wake-up lands inside it. Measured from the GIF's own timeline, so
+    /// frames keep their timing however long drawing the last one took.
+    pub fn until_next_frame(&self, elapsed: Duration, fps: f32, looping: GifLoop) -> Duration {
+        const SETTLE: Duration = Duration::from_millis(1);
         if fps > 0.0 {
-            Duration::from_secs_f32(1.0 / fps)
-        } else {
-            self.delays.iter().copied().min().unwrap_or(MIN_FRAME)
+            let fps = f64::from(fps);
+            let next = ((elapsed.as_secs_f64() * fps + 1e-6).floor() + 1.0) / fps;
+            return Duration::from_secs_f64(next).saturating_sub(elapsed) + SETTLE;
         }
+        let cycle = self.cycle_duration(0.0, looping).as_nanos().max(1);
+        let into = elapsed.as_nanos() % cycle;
+        let mut boundary = 0;
+        for step in 0..self.steps(looping) {
+            boundary += self.delays[self.step_frame(step)].as_nanos();
+            if boundary > into {
+                break;
+            }
+        }
+        // The steps add up to the cycle, so a boundary past `into` is found.
+        Duration::from_nanos(u64::try_from(boundary - into).unwrap_or(u64::MAX)) + SETTLE
     }
 }
 
@@ -239,9 +317,18 @@ pub struct Sprite {
 
 /// Rescales row-major levels. Each target pixel averages the source pixels it
 /// covers, so shrinking keeps detail and enlarging stays crisp (pixel art).
-fn resample(source: &[u8], from_w: usize, from_h: usize, to_w: usize, to_h: usize) -> Vec<u8> {
+/// Scales a row-major frame. `smooth` averages the source pixels each
+/// target pixel covers; otherwise each takes the source pixel at its middle.
+fn resample(source: &[u8], from_w: usize, from_h: usize, to_w: usize, to_h: usize, smooth: bool) -> Vec<u8> {
     if (from_w, from_h) == (to_w, to_h) {
         return source.to_vec();
+    }
+    if !smooth {
+        let middle = |target: usize, from: usize, to: usize| ((2 * target + 1) * from / (2 * to)).min(from - 1);
+        return (0..to_h)
+            .flat_map(|y| (0..to_w).map(move |x| (x, y)))
+            .map(|(x, y)| source[middle(y, from_h, to_h) * from_w + middle(x, from_w, to_w)])
+            .collect();
     }
     let span = |target: usize, from: usize, to: usize| {
         let start = target * from / to;
@@ -286,6 +373,21 @@ mod tests {
     }
 
     #[test]
+    fn next_frame_is_timed_from_the_gif_timeline() {
+        let ms = Duration::from_millis;
+        let gif = animation(&[100, 300, 50]);
+        // Own delays: frames start at 0, 100, 400 and the loop restarts at 450.
+        assert_eq!(gif.until_next_frame(ms(30), 0.0, GifLoop::Restart), ms(71));
+        assert_eq!(gif.until_next_frame(ms(250), 0.0, GifLoop::Restart), ms(151));
+        assert_eq!(gif.until_next_frame(ms(420), 0.0, GifLoop::Restart), ms(31));
+        assert_eq!(gif.until_next_frame(ms(450 * 1000 + 30), 0.0, GifLoop::Restart), ms(71));
+        // FPS override: a fixed grid, and the wake-up lands in the next frame.
+        assert_eq!(gif.until_next_frame(ms(130), 10.0, GifLoop::Restart), ms(71));
+        let woke = ms(130) + gif.until_next_frame(ms(130), 10.0, GifLoop::Restart);
+        assert_eq!(gif.index_at(woke, 10.0, GifLoop::Restart), 2);
+    }
+
+    #[test]
     fn one_cycle_uses_delays_or_the_fps_override() {
         let gif = animation(&[100, 300, 500]);
         assert_eq!(gif.cycle_duration(0.0, GifLoop::Restart), Duration::from_millis(900));
@@ -316,6 +418,46 @@ mod tests {
     }
 
     #[test]
+    fn pngs_and_jpegs_load_as_one_still_frame() {
+        let directory = tempfile::tempdir().unwrap();
+        // White, mid grey, and white but half transparent.
+        let png = directory.path().join("picture.png");
+        image::RgbaImage::from_vec(3, 1, vec![255, 255, 255, 255, 128, 128, 128, 255, 255, 255, 255, 128])
+            .unwrap().save(&png).unwrap();
+        let still = GifAnimation::load(&png).unwrap();
+        assert_eq!((still.width, still.height, still.frames.len()), (3, 1, 1));
+        assert!(!still.is_animated());
+        assert_eq!(still.frames[0], [255, 128, 128]);
+
+        // Found by content, whatever the extension says.
+        let jpeg = directory.path().join("photo.gif");
+        image::RgbImage::from_pixel(4, 4, image::Rgb([200, 200, 200]))
+            .save_with_format(&jpeg, image::ImageFormat::Jpeg).unwrap();
+        let photo = GifAnimation::load(&jpeg).unwrap();
+        assert_eq!((photo.width, photo.height), (4, 4));
+        assert!(photo.frames[0].iter().all(|&level| level.abs_diff(200) < 6));
+    }
+
+    #[test]
+    fn scale_multiplies_the_layouts_size_and_stays_centred() {
+        let geometry = MatrixGeometry::for_board_name("GA402RK");
+        let (w, h) = (geometry.width as usize, geometry.height as usize);
+        let gif = two_pixels();
+        let lit = |layout, scale| {
+            let canvas = gif.placed_on(0, layout, geometry, geometry, false, scale);
+            let spots: Vec<_> = (0..w * h).filter(|&i| canvas[i] > 0).map(|i| (i % w, i / w)).collect();
+            (spots.len(), *spots.first().unwrap())
+        };
+        // 2x1 pixels at x4 -> 8x4, still centred.
+        assert_eq!(lit(GifLayout::AsIs, 4.0), (8 * 4, (33, 17)));
+        // Fit (74x37) at half size -> 37x19 (rounded).
+        assert_eq!(lit(GifLayout::Fit, 0.5).0, 37 * 19);
+        // Nearest-pixel scaling keeps the two source levels, nothing blended.
+        let canvas = gif.placed_on(0, GifLayout::AsIs, geometry, geometry, false, 4.0);
+        assert!(canvas.iter().all(|&level| [0, 100, 200].contains(&level)));
+    }
+
+    #[test]
     fn layouts_place_centre_fit_and_stretch() {
         let geometry = MatrixGeometry::for_board_name("GA402RK");
         let (w, h) = (geometry.width as usize, geometry.height as usize);
@@ -335,10 +477,11 @@ mod tests {
     #[test]
     fn sprites_keep_aspect_and_average_when_shrinking() {
         let gif = two_pixels();
-        let big = gif.sprite(0, 4);
+        let big = gif.sprite(0, 4, true);
         assert_eq!((big.width, big.height), (8, 4));
         assert_eq!(&big.levels[..8], &[200, 200, 200, 200, 100, 100, 100, 100]);
-        assert_eq!(resample(&[200, 100], 2, 1, 1, 1), [150]);
+        assert_eq!(resample(&[200, 100], 2, 1, 1, 1, true), [150]);
+        assert_eq!(resample(&[200, 100, 50, 25], 4, 1, 2, 1, false), [100, 25]);
     }
 
     #[test]

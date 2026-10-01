@@ -8,7 +8,7 @@ Start with **Setup** if you have not installed Animatrix yet, then **Profiles** 
 | [Installing](installing.md)            | Build dependencies, `make upgrade`, the Debian package, `make install`, all Make targets |
 | [Profiles](profiles.md)                | Profiles, layering, element cycling, play counts, reordering, the tray                   |
 | [Elements](elements.md)                | Clock, text, GIF, flashlight, and battery, with every option                             |
-| [Device behaviour and tray](device.md) | Brightness, power and lid settings, lid close delay, Settings tab, tray icon            |
+| [Device behaviour and tray](device.md) | Brightness, power and lid settings, lid close delay, Settings tab, panel preview, tray   |
 | [Scripting](scripting.md)              | Switching profiles and the light show from scripts, the CLI flags and D-Bus actions      |
 | [How it works](architecture.md)        | Engine, D-Bus frames, panel canvas and safe area, configuration file, safety             |
 

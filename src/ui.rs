@@ -8,9 +8,9 @@ use std::time::Duration;
 use animatrix::{
     AppConfig, BatteryStyle, ConfigStore, DisplayProfile, Element, ElementKind, EngineCommand,
     EngineHandle, GifLayout, GifLoop, MatrixGeometry, OverlayColor, DevicePolicy, ProfileTriggers, Trigger,
-    ScrollDirection, TextMode, WindowState,
+    ScrollDirection, TextMode, Transition, TurnLength, WindowState,
 };
-use animatrix::model::{MAX_BLACK_LEVEL, MAX_CONTRAST, MAX_FPS, MAX_GIF_BRIGHTNESS, MAX_OUTLINE, MAX_SCROLL_PAUSE, MAX_SPRITE_SIZE, MIN_CONTRAST};
+use animatrix::model::{MAX_BATTERY_SCALE, MIN_BATTERY_SCALE, MAX_GIF_SCALE, MIN_GIF_SCALE, MAX_TRANSITION, MAX_BLACK_LEVEL, MAX_CONTRAST, MAX_FPS, MAX_GIF_BRIGHTNESS, MAX_OUTLINE, MAX_SCROLL_PAUSE, MAX_SPRITE_SIZE, MIN_CONTRAST};
 use gtk::glib;
 use gtk::prelude::*;
 
@@ -25,6 +25,8 @@ struct UiContext {
     /// Profiles shown expanded. Starts with only the active one and lives
     /// for the session, so page rebuilds keep what the user opened.
     expanded: Rc<RefCell<HashSet<String>>>,
+    /// Elements folded to their heading, likewise for the session.
+    collapsed_elements: Rc<RefCell<HashSet<String>>>,
 }
 
 use crate::remote::APP_ID;
@@ -42,6 +44,7 @@ pub fn run(config: Arc<Mutex<AppConfig>>, store: ConfigStore, engine: EngineHand
         engine,
         active_buttons: Rc::default(),
         expanded: Rc::new(RefCell::new(expanded)),
+        collapsed_elements: Rc::default(),
     };
 
     #[cfg(feature = "tray")]
@@ -208,15 +211,24 @@ fn build_window(app: &gtk::Application, context: UiContext) -> gtk::ApplicationW
     });
     root.append(&notebook);
 
+    let preview = panel_preview(&context);
+    root.append(&preview.handle);
+    root.append(&preview.area);
     let status = gtk::Label::builder()
         .xalign(0.0)
+        .hexpand(true)
         .wrap(true)
         .margin_top(6)
         .margin_bottom(6)
         .margin_start(12)
         .margin_end(12)
         .build();
-    root.append(&status);
+    let bar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    bar.append(&status);
+    preview.toggle.set_valign(gtk::Align::Center);
+    preview.toggle.set_margin_end(12);
+    bar.append(&preview.toggle);
+    root.append(&bar);
     let status_engine = context.engine.clone();
     let status_config = Arc::clone(&context.config);
     let active_buttons = Rc::clone(&context.active_buttons);
@@ -238,7 +250,7 @@ fn build_window(app: &gtk::Application, context: UiContext) -> gtk::ApplicationW
             status.add_css_class("error");
         } else {
             status.set_text(&format!(
-                "Ready — {:?} pixel-image canvas {}×{}",
+                "Ready - {:?} pixel-image canvas {}×{}",
                 geometry.model, geometry.width, geometry.height
             ));
             status.remove_css_class("error");
@@ -248,7 +260,9 @@ fn build_window(app: &gtk::Application, context: UiContext) -> gtk::ApplicationW
     // stops the timer.
     let timer: Rc<RefCell<Option<glib::SourceId>>> = Rc::default();
     let (map_timer, map_refresh) = (Rc::clone(&timer), Rc::clone(&refresh));
+    let (map_preview, unmap_preview) = (preview.clone(), preview.clone());
     window.connect_map(move |_| {
+        map_preview.set_running(map_preview.toggle.is_active());
         map_refresh();
         let tick = Rc::clone(&map_refresh);
         let source = glib::timeout_add_local(Duration::from_millis(500), move || {
@@ -260,6 +274,7 @@ fn build_window(app: &gtk::Application, context: UiContext) -> gtk::ApplicationW
         }
     });
     window.connect_unmap(move |_| {
+        unmap_preview.set_running(false);
         if let Some(source) = timer.take() {
             source.remove();
         }
@@ -309,12 +324,14 @@ fn rebuild_profiles(content: &gtk::Box, context: &UiContext) {
     let snapshot = context.config.lock().map(|config| config.clone()).unwrap_or_default();
 
     let mut active_group = None;
-    for profile in snapshot.profiles {
+    let count = snapshot.profiles.len();
+    for (index, profile) in snapshot.profiles.into_iter().enumerate() {
         let (card, active) = profile_card(
             context.clone(),
             content.clone(),
             profile,
             active_group.as_ref(),
+            (index > 0, index + 1 < count),
         );
         if active_group.is_none() {
             active_group = Some(active);
@@ -344,12 +361,12 @@ fn triggers_section(context: &UiContext, snapshot: &AppConfig) -> gtk::Frame {
 
     type Slot = fn(&mut ProfileTriggers) -> &mut Trigger;
     let rows: [(&str, Slot); 6] = [
-        ("When plugged in", |triggers| &mut triggers.plugged_in),
-        ("When unplugged", |triggers| &mut triggers.unplugged),
+        ("When the lid is open and plugging in", |triggers| &mut triggers.plugged_in),
+        ("When the lid is open and unplugging", |triggers| &mut triggers.unplugged),
         ("When the lid closes", |triggers| &mut triggers.lid_closed),
         ("When the lid opens", |triggers| &mut triggers.lid_opened),
-        ("When the lid is closed and plugged in", |triggers| &mut triggers.lid_closed_plugged_in),
-        ("When the lid is open and plugged in", |triggers| &mut triggers.lid_opened_plugged_in),
+        ("When the lid is closed and plugging in", |triggers| &mut triggers.closed_plugged_in),
+        ("When the lid is closed and unplugging", |triggers| &mut triggers.closed_unplugged),
     ];
     for (label, slot) in rows {
         let mut current = snapshot.triggers.clone();
@@ -396,6 +413,8 @@ fn profile_card(
     content: gtk::Box,
     profile: DisplayProfile,
     active_group: Option<&gtk::CheckButton>,
+    // Whether it can move (up, down) in the profile list.
+    movable: (bool, bool),
 ) -> (gtk::Frame, gtk::CheckButton) {
     let frame = gtk::Frame::new(None);
     let card = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -451,63 +470,108 @@ fn profile_card(
     heading.append(&active);
     context.active_buttons.borrow_mut().push((profile.id.clone(), active.clone()));
 
-    let delete = gtk::Button::with_label("Delete");
-    delete.add_css_class("destructive-action");
-    let id = profile.id.clone();
-    let delete_context = context.clone();
-    let delete_content = content.clone();
-    delete.connect_clicked(move |_| {
-        mutate_config(&delete_context, false, |config| {
-            config.profiles.retain(|profile| profile.id != id);
-            config.triggers.forget(&id);
-            if config.active_profile.as_deref() == Some(id.as_str()) {
-                config.active_profile = config.profiles.first().map(|profile| profile.id.clone());
+    // Cycling profiles can be played from their first element again.
+    if profile.cycle.enabled {
+        let play = gtk::Button::with_label("▶ Play from start");
+        play.set_tooltip_text(Some("Show this profile's elements from the first one again, making it active if it is not"));
+        let (play_context, id) = (context.clone(), profile.id.clone());
+        play.connect_clicked(move |_| {
+            let active = play_context.config.lock().ok().and_then(|config| config.active_profile.clone());
+            if active.as_deref() != Some(id.as_str()) {
+                mutate_config(&play_context, false, |config| config.active_profile = Some(id.clone()));
             }
+            play_context.engine.send(EngineCommand::Restart);
         });
-        rebuild_profiles(&delete_content, &delete_context);
-    });
-    heading.append(&delete);
+        heading.append(&play);
+    }
+    // The order is also the tray menu's.
+    for (label, tooltip, step, enabled) in [("↑", "Move up", -1_isize, movable.0), ("↓", "Move down", 1, movable.1)] {
+        let button = gtk::Button::with_label(label);
+        button.set_tooltip_text(Some(tooltip));
+        button.set_sensitive(enabled);
+        let (move_context, move_content, id) = (context.clone(), content.clone(), profile.id.clone());
+        button.connect_clicked(move |_| {
+            mutate_config(&move_context, false, |config| {
+                if let Some(from) = config.profiles.iter().position(|profile| profile.id == id) {
+                    let to = from.saturating_add_signed(step);
+                    if to < config.profiles.len() {
+                        config.profiles.swap(from, to);
+                    }
+                }
+            });
+            rebuild_profiles(&move_content, &move_context);
+        });
+        heading.append(&button);
+    }
+    // Active last, so it sits at the edge of the heading.
+    heading.reorder_child_after(&active, heading.last_child().as_ref());
     card.append(&heading);
 
-    let cycle_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    let cycle = gtk::CheckButton::with_label("Cycle through elements every");
-    cycle.set_active(profile.cycle.enabled);
-    cycle.set_tooltip_text(Some("Show one element at a time instead of layering them all"));
-    let cycle_context = context.clone();
-    let id = profile.id.clone();
-    cycle.connect_toggled(move |check| {
-        let enabled = check.is_active();
-        mutate_profile(&cycle_context, &id, |profile| profile.cycle.enabled = enabled);
+    // Deleting sits at the bottom of the card, away from Active, and asks first.
+    let delete = gtk::Button::with_label("Delete profile…");
+    delete.add_css_class("destructive-action");
+    let (delete_context, delete_content, id, name) = (context.clone(), content.clone(), profile.id.clone(), profile.name.clone());
+    delete.connect_clicked(move |button| {
+        let dialog = gtk::AlertDialog::builder()
+            .modal(true)
+            .message(format!("Delete the profile “{name}”?"))
+            .detail("Its elements go with it. This cannot be undone.")
+            .buttons(["Cancel", "Delete"])
+            .cancel_button(0)
+            .default_button(0)
+            .build();
+        let window = button.root().and_downcast::<gtk::Window>();
+        let (context, content, id) = (delete_context.clone(), delete_content.clone(), id.clone());
+        dialog.choose(window.as_ref(), gtk::gio::Cancellable::NONE, move |choice| {
+            if choice != Ok(1) {
+                return;
+            }
+            mutate_config(&context, false, |config| {
+                config.profiles.retain(|profile| profile.id != id);
+                config.triggers.forget(&id);
+                if config.active_profile.as_deref() == Some(id.as_str()) {
+                    config.active_profile = config.profiles.first().map(|profile| profile.id.clone());
+                }
+            });
+            rebuild_profiles(&content, &context);
+        });
     });
-    let seconds = gtk::SpinButton::with_range(1.0, 3600.0, 1.0);
-    seconds.set_value(profile.cycle.seconds as f64);
-    let seconds_context = context.clone();
-    let id = profile.id.clone();
-    seconds.connect_value_changed(move |spin| {
-        let value = spin.value() as u32;
-        mutate_profile(&seconds_context, &id, |profile| profile.cycle.seconds = value);
+
+    // Layered or one at a time; the cycle settings only show for the latter.
+    let arrangement = gtk::DropDown::from_strings(&["Layered (all at once)", "One at a time"]);
+    arrangement.set_selected(u32::from(profile.cycle.enabled));
+    arrangement.set_tooltip_text(Some(
+        "Layered draws every element together, the brightest wins where they overlap. One at a time cycles through them.",
+    ));
+    let (arrangement_context, arrangement_content, id) = (context.clone(), content.clone(), profile.id.clone());
+    arrangement.connect_selected_notify(move |dropdown| {
+        let enabled = dropdown.selected() == 1;
+        mutate_profile(&arrangement_context, &id, |profile| profile.cycle.enabled = enabled);
+        // Shows or hides each element's turn length.
+        rebuild_profiles(&arrangement_content, &arrangement_context);
     });
-    cycle_row.append(&cycle);
-    cycle_row.append(&seconds);
-    cycle_row.append(&gtk::Label::new(Some("seconds")));
-    let after = gtk::CheckButton::with_label("or after animation cycles finish");
-    after.set_active(profile.cycle.after_animations);
-    after.set_tooltip_text(Some("Text and GIF elements with Cycles ticked stay until they have played that many times"));
-    let after_context = context.clone();
-    let id = profile.id.clone();
-    after.connect_toggled(move |check| {
+    let arrangement_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    arrangement_row.append(&gtk::Label::new(Some("Elements:")));
+    arrangement_row.append(&arrangement);
+    let repeat = gtk::CheckButton::with_label("Repeat");
+    repeat.set_active(profile.cycle.repeat);
+    repeat.set_visible(profile.cycle.enabled);
+    repeat.set_tooltip_text(Some("Start over after the last element. Unticked, the last element stays once reached."));
+    let (repeat_context, id) = (context.clone(), profile.id.clone());
+    repeat.connect_toggled(move |check| {
         let value = check.is_active();
-        mutate_profile(&after_context, &id, |profile| profile.cycle.after_animations = value);
+        mutate_profile(&repeat_context, &id, |profile| profile.cycle.repeat = value);
     });
-    cycle_row.append(&after);
-    details.append(&cycle_row);
+    arrangement_row.append(&repeat);
+    details.append(&arrangement_row);
+
 
     let elements_row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     elements_row.append(&gtk::Label::new(Some("Add element:")));
     for (label, constructor) in [
         ("Clock", Element::clock as fn() -> Element),
         ("Text", Element::text as fn() -> Element),
-        ("GIF", Element::gif as fn() -> Element),
+        ("GIF/Image", Element::gif as fn() -> Element),
         ("Flashlight", Element::flashlight as fn() -> Element),
         ("Battery", Element::battery as fn() -> Element),
     ] {
@@ -530,8 +594,27 @@ fn profile_card(
     for (index, element) in profile.elements.iter().enumerate() {
         let target = ElementTarget { profile: profile.id.clone(), element: element.id.clone() };
         let position = (index > 0, index + 1 < count);
-        details.append(&element_card(context.clone(), content.clone(), target, element.clone(), position));
+        details.append(&element_card(context.clone(), content.clone(), target, element.clone(), position, profile.cycle.enabled));
     }
+    let duplicate = gtk::Button::with_label("Duplicate");
+    duplicate.set_tooltip_text(Some("Add a copy of this profile below it, with all its elements"));
+    let (copy_context, copy_content, id) = (context.clone(), content.clone(), profile.id.clone());
+    duplicate.connect_clicked(move |_| {
+        mutate_config(&copy_context, false, |config| {
+            if let Some(index) = config.profiles.iter().position(|profile| profile.id == id) {
+                let copy = config.profiles[index].duplicate();
+                // Open, so its elements are right there to edit.
+                copy_context.expanded.borrow_mut().insert(copy.id.clone());
+                config.profiles.insert(index + 1, copy);
+            }
+        });
+        rebuild_profiles(&copy_content, &copy_context);
+    });
+    let footer = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    footer.set_halign(gtk::Align::End);
+    footer.append(&duplicate);
+    footer.append(&delete);
+    details.append(&footer);
     card.append(&details);
     frame.set_child(Some(&card));
     (frame, active)
@@ -551,6 +634,8 @@ fn element_card(
     target: ElementTarget,
     element: Element,
     movable: (bool, bool),
+    // Whether the profile shows one element at a time, so turns matter.
+    show_turn: bool,
 ) -> gtk::Frame {
     let frame = gtk::Frame::new(None);
     let card = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -560,7 +645,72 @@ fn element_card(
     card.set_margin_end(8);
 
     let heading = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    // Everything below the heading, hidden while the element is collapsed.
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let open = !context.collapsed_elements.borrow().contains(&element.id);
+    body.set_visible(open);
+    let expander = gtk::ToggleButton::builder()
+        .icon_name(if open { "pan-down-symbolic" } else { "pan-end-symbolic" })
+        .tooltip_text("Show or hide this element's settings")
+        .valign(gtk::Align::Center)
+        .active(open)
+        .build();
+    expander.add_css_class("flat");
+    let (fold_body, collapsed, id) = (body.clone(), Rc::clone(&context.collapsed_elements), element.id.clone());
+    expander.connect_toggled(move |button| {
+        let open = button.is_active();
+        fold_body.set_visible(open);
+        button.set_icon_name(if open { "pan-down-symbolic" } else { "pan-end-symbolic" });
+        if open { collapsed.borrow_mut().remove(&id); } else { collapsed.borrow_mut().insert(id.clone()); }
+    });
+    heading.append(&expander);
     heading.append(&gtk::Label::builder().label(element.kind.label()).css_classes(["heading"]).xalign(0.0).hexpand(true).build());
+    if !matches!(element.kind, ElementKind::Flashlight { .. }) {
+        let rotation = gtk::SpinButton::with_range(-360.0, 360.0, 1.0);
+        rotation.set_value(element.rotation as f64);
+        rotation.set_tooltip_text(Some("Degrees to turn this element clockwise; type any value"));
+        let (rotate_context, rotate_target) = (context.clone(), target.clone());
+        rotation.connect_value_changed(move |spin| {
+            let value = spin.value() as f32;
+            mutate_profile(&rotate_context, &rotate_target.profile, |profile| {
+                if let Some(element) = profile.element_mut(&rotate_target.element) {
+                    element.rotation = value;
+                }
+            });
+        });
+        heading.append(&gtk::Label::new(Some("Rotate °")));
+        heading.append(&rotation);
+
+        let tilt = gtk::CheckButton::with_label("Tilt compensation");
+        tilt.set_active(element.tilt_compensation);
+        tilt.set_tooltip_text(Some(
+            "Lean this element against the panel's row shift so upright strokes look upright. The amount is set on the Settings tab.",
+        ));
+        let (tilt_context, tilt_target) = (context.clone(), target.clone());
+        tilt.connect_toggled(move |check| {
+            let value = check.is_active();
+            mutate_profile(&tilt_context, &tilt_target.profile, |profile| {
+                if let Some(element) = profile.element_mut(&tilt_target.element) {
+                    element.tilt_compensation = value;
+                }
+            });
+        });
+        heading.append(&tilt);
+
+        let smooth = gtk::CheckButton::with_label("Smooth font edges");
+        smooth.set_active(element.smooth_text);
+        smooth.set_tooltip_text(Some("Anti-alias text. Off lights each LED fully or not at all, which can look crisper on the panel."));
+        let (smooth_context, smooth_target) = (context.clone(), target.clone());
+        smooth.connect_toggled(move |check| {
+            let value = check.is_active();
+            mutate_profile(&smooth_context, &smooth_target.profile, |profile| {
+                if let Some(element) = profile.element_mut(&smooth_target.element) {
+                    element.smooth_text = value;
+                }
+            });
+        });
+        heading.append(&smooth);
+    }
     // Order sets the sequence when the profile cycles its elements.
     for (label, tooltip, step, enabled) in [
         ("↑", "Move up", -1_isize, movable.0),
@@ -584,6 +734,19 @@ fn element_card(
         });
         heading.append(&button);
     }
+    let duplicate = gtk::Button::with_label("Duplicate");
+    duplicate.set_tooltip_text(Some("Add a copy of this element below it"));
+    let (copy_context, copy_target, copy_content) = (context.clone(), target.clone(), content.clone());
+    duplicate.connect_clicked(move |_| {
+        mutate_profile(&copy_context, &copy_target.profile, |profile| {
+            if let Some(index) = profile.elements.iter().position(|element| element.id == copy_target.element) {
+                let copy = profile.elements[index].duplicate();
+                profile.elements.insert(index + 1, copy);
+            }
+        });
+        rebuild_profiles(&copy_content, &copy_context);
+    });
+    heading.append(&duplicate);
     let remove = gtk::Button::with_label("Remove");
     let remove_context = context.clone();
     let remove_target = target.clone();
@@ -596,18 +759,21 @@ fn element_card(
     });
     heading.append(&remove);
     card.append(&heading);
+    if show_turn {
+        body.append(&turn_row(&context, &target, &element));
+    }
 
     let grid = gtk::Grid::builder().column_spacing(12).row_spacing(8).build();
     match element.kind.clone() {
         ElementKind::Clock {
-            font, font_size, use_24_hour, show_seconds, show_date, date_format, show_millis, fps, y_offset,
-            ignore_safe_area,
+            font, font_size, use_24_hour, show_seconds, show_date, date_format, show_millis, fps, y_offset, x_offset,
+            ignore_safe_area, date_first, millis_digits,
         } => {
             let font_entry = file_row(&grid, 0, "Font file", &font.to_string_lossy(), FileKind::Font);
             connect_element_entry(&font_entry, context.clone(), target.clone(), |kind, value| {
                 if let ElementKind::Clock { font, .. } = kind { *font = value.into(); }
             });
-            let size = spin_row(&grid, 1, "Font size", 6.0, 40.0, font_size as f64);
+            let size = spin_row(&grid, 1, "Font size", MIN_FONT_SIZE, 40.0, font_size as f64);
             connect_element_spin(&size, context.clone(), target.clone(), |kind, value| {
                 if let ElementKind::Clock { font_size, .. } = kind { *font_size = value as f32; }
             });
@@ -635,22 +801,30 @@ fn element_card(
             connect_element_spin(&fps, context.clone(), target.clone(), |kind, value| {
                 if let ElementKind::Clock { fps, .. } = kind { *fps = value as f32; }
             });
-            offset_row(&grid, 8, y_offset, context.clone(), target.clone());
+            offset_row(&grid, 8, (x_offset, y_offset), context.clone(), target.clone());
+            let digits = spin_row(&grid, 11, "Millisecond digits", 1.0, 3.0, f64::from(millis_digits));
+            connect_element_spin(&digits, context.clone(), target.clone(), |kind, value| {
+                if let ElementKind::Clock { millis_digits, .. } = kind { *millis_digits = value as u8; }
+            });
+            let order = check_row(&grid, 10, "Date above the time", date_first);
+            connect_element_check(&order, context.clone(), target.clone(), |kind, value| {
+                if let ElementKind::Clock { date_first, .. } = kind { *date_first = value; }
+            });
             safe_area_row(&grid, 9, ignore_safe_area, context, target);
         }
         ElementKind::Text {
-            text, font, font_size, mode, speed, fps, ignore_safe_area, scroll_pause, direction, period, y_offset,
-            limit_plays, plays,
+            text, font, font_size, mode, speed, fps, ignore_safe_area, scroll_pause, direction, period, y_offset, x_offset,
+            limit_plays: _, plays: _, outline, invert, color,
         } => {
-            let text_entry = entry_row(&grid, 0, "Text", &text);
-            connect_element_entry(&text_entry, context.clone(), target.clone(), |kind, value| {
+            let text_box = text_area_row(&grid, 0, "Text", &text);
+            connect_element_text(&text_box, context.clone(), target.clone(), |kind, value| {
                 if let ElementKind::Text { text, .. } = kind { *text = value; }
             });
             let font_entry = file_row(&grid, 1, "Font file", &font.to_string_lossy(), FileKind::Font);
             connect_element_entry(&font_entry, context.clone(), target.clone(), |kind, value| {
                 if let ElementKind::Text { font, .. } = kind { *font = value.into(); }
             });
-            let size = spin_row(&grid, 2, "Font size", 6.0, 40.0, font_size as f64);
+            let size = spin_row(&grid, 2, "Font size", MIN_FONT_SIZE, 40.0, font_size as f64);
             connect_element_spin(&size, context.clone(), target.clone(), |kind, value| {
                 if let ElementKind::Text { font_size, .. } = kind { *font_size = value as f32; }
             });
@@ -691,15 +865,36 @@ fn element_card(
                 if let ElementKind::Text { scroll_pause, .. } = kind { *scroll_pause = value as f32; }
             });
             safe_area_row(&grid, 9, ignore_safe_area, context.clone(), target.clone());
-            offset_row(&grid, 10, y_offset, context.clone(), target.clone());
-            plays_row(&grid, 11, limit_plays, plays, context, target);
+            offset_row(&grid, 10, (x_offset, y_offset), context.clone(), target.clone());
+            let border = spin_row(&grid, 12, "Outline in pixels (opposite of the text color)", 0.0, MAX_OUTLINE as f64, outline as f64);
+            border.set_tooltip_text(Some("A dark border around the text so it stays readable over other elements"));
+            connect_element_spin(&border, context.clone(), target.clone(), |kind, value| {
+                if let ElementKind::Text { outline, .. } = kind { *outline = value as u32; }
+            });
+            let labels = OverlayColor::ALL.map(OverlayColor::label);
+            let selected = OverlayColor::ALL.iter().position(|value| *value == color).unwrap_or(0);
+            let tint = dropdown_row(&grid, 14, "Text color", &labels, selected);
+            tint.set_tooltip_text(Some(
+                "White lights LEDs, with a dark outline. Black cuts the text out of the elements beneath, with a lit outline.",
+            ));
+            connect_element_dropdown(&tint, context.clone(), target.clone(), |kind, index| {
+                if let (ElementKind::Text { color, .. }, Some(value)) = (kind, OverlayColor::ALL.get(index)) {
+                    *color = *value;
+                }
+            });
+            let inverted = check_row(&grid, 13, "Invert (white: light the panel around dark text; black: cut out all but the text)", invert);
+            connect_element_check(&inverted, context.clone(), target.clone(), |kind, value| {
+                if let ElementKind::Text { invert, .. } = kind { *invert = value; }
+            });
+
         }
         ElementKind::Gif {
-            path, brightness, contrast, black_level, fps, limit_plays, plays, looping, layout, size, mode, direction, speed, motion_fps, period,
-            scroll_pause, ignore_safe_area, y_offset, overlay_text, overlay_color, overlay_font, overlay_size,
-            overlay_bold, overlay_italic, overlay_outline,
+            path, brightness, contrast, black_level, fps, limit_plays: _, plays: _, looping, layout, size, mode, direction, speed, motion_fps, period,
+            scroll_pause, ignore_safe_area, y_offset, x_offset, overlay_text, overlay_color, overlay_font, overlay_size,
+            overlay_bold, overlay_italic, overlay_outline, overlay_x_offset, overlay_y_offset, smooth_scaling, overlay_rotation, overlay_mode,
+            overlay_direction, overlay_speed, overlay_period, overlay_scroll_pause, invert, scale, invert_gif_only,
         } => {
-            let path_entry = file_row(&grid, 0, "GIF file", &path.to_string_lossy(), FileKind::Gif);
+            let path_entry = file_row(&grid, 0, "GIF, PNG, or JPEG file", &path.to_string_lossy(), FileKind::Gif);
             connect_element_entry(&path_entry, context.clone(), target.clone(), |kind, value| {
                 if let ElementKind::Gif { path, .. } = kind { *path = value.into(); }
             });
@@ -724,7 +919,7 @@ fn element_card(
             connect_element_spin(&fps, context.clone(), target.clone(), |kind, value| {
                 if let ElementKind::Gif { fps, .. } = kind { *fps = value as f32; }
             });
-            plays_row(&grid, 5, limit_plays, plays, context.clone(), target.clone());
+
             let labels = GifLoop::ALL.map(GifLoop::label);
             let selected = GifLoop::ALL.iter().position(|value| *value == looping).unwrap_or(0);
             let repeat = dropdown_row(&grid, 6, "Loop", &labels, selected);
@@ -734,8 +929,8 @@ fn element_card(
                 }
             });
 
-            let overlay = entry_row(&grid, 22, "Overlay text (optional)", &overlay_text);
-            connect_element_entry(&overlay, context.clone(), target.clone(), |kind, value| {
+            let overlay = text_area_row(&grid, 22, "Overlay text (optional)", &overlay_text);
+            connect_element_text(&overlay, context.clone(), target.clone(), |kind, value| {
                 if let ElementKind::Gif { overlay_text, .. } = kind { *overlay_text = value; }
             });
             let labels = OverlayColor::ALL.map(OverlayColor::label);
@@ -750,7 +945,7 @@ fn element_card(
             connect_element_entry(&overlay_font_entry, context.clone(), target.clone(), |kind, value| {
                 if let ElementKind::Gif { overlay_font, .. } = kind { *overlay_font = value.into(); }
             });
-            let overlay_scale = spin_row(&grid, 25, "Overlay font size", 6.0, 40.0, overlay_size as f64);
+            let overlay_scale = spin_row(&grid, 25, "Overlay font size", MIN_FONT_SIZE, 40.0, overlay_size as f64);
             connect_element_spin(&overlay_scale, context.clone(), target.clone(), |kind, value| {
                 if let ElementKind::Gif { overlay_size, .. } = kind { *overlay_size = value as f32; }
             });
@@ -765,6 +960,75 @@ fn element_card(
             let border = spin_row(&grid, 28, "Overlay outline in pixels (opposite color)", 0.0, MAX_OUTLINE as f64, overlay_outline as f64);
             connect_element_spin(&border, context.clone(), target.clone(), |kind, value| {
                 if let ElementKind::Gif { overlay_outline, .. } = kind { *overlay_outline = value as u32; }
+            });
+            let overlay_spins = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            for (label, value, horizontal) in [("→", overlay_x_offset, true), ("↓", overlay_y_offset, false)] {
+                let spin = gtk::SpinButton::with_range(-74.0, 74.0, 1.0);
+                spin.set_value(value as f64);
+                spin.set_tooltip_text(Some(if horizontal { "Pixels right of centre; negative moves left" } else { "Pixels below centre; negative moves up" }));
+                connect_element_spin(&spin, context.clone(), target.clone(), move |kind, value| {
+                    if let ElementKind::Gif { overlay_x_offset, overlay_y_offset, .. } = kind {
+                        *(if horizontal { overlay_x_offset } else { overlay_y_offset }) = value as i32;
+                    }
+                });
+                overlay_spins.append(&gtk::Label::new(Some(label)));
+                overlay_spins.append(&spin);
+            }
+            grid.attach(&gtk::Label::builder().label("Overlay position (pixels from centre)").xalign(0.0).build(), 0, 29, 1, 1);
+            grid.attach(&overlay_spins, 1, 29, 1, 1);
+            // The overlay animates like a text element, stepping with the GIF.
+            let labels = TextMode::ALL.map(TextMode::label);
+            let selected = TextMode::ALL.iter().position(|value| *value == overlay_mode).unwrap_or(0);
+            let overlay_animation = dropdown_row(&grid, 31, "Overlay animation", &labels, selected);
+            overlay_animation.set_tooltip_text(Some(
+                "Steps at the GIF's FPS when set, otherwise as fast as its quickest frame (at most 30 FPS)",
+            ));
+            connect_element_dropdown(&overlay_animation, context.clone(), target.clone(), |kind, index| {
+                if let (ElementKind::Gif { overlay_mode, .. }, Some(value)) = (kind, TextMode::ALL.get(index)) {
+                    *overlay_mode = *value;
+                }
+            });
+            let labels = ScrollDirection::ALL.map(ScrollDirection::label);
+            let selected = ScrollDirection::ALL.iter().position(|value| *value == overlay_direction).unwrap_or(0);
+            let overlay_heading = dropdown_row(&grid, 32, "Overlay direction (scroll, bounce)", &labels, selected);
+            connect_element_dropdown(&overlay_heading, context.clone(), target.clone(), |kind, index| {
+                if let (ElementKind::Gif { overlay_direction, .. }, Some(value)) = (kind, ScrollDirection::ALL.get(index)) {
+                    *overlay_direction = *value;
+                }
+            });
+            let overlay_pace = spin_row(&grid, 33, "Overlay pixels per second (scroll, bounce)", 1.0, 100.0, overlay_speed as f64);
+            connect_element_spin(&overlay_pace, context.clone(), target.clone(), |kind, value| {
+                if let ElementKind::Gif { overlay_speed, .. } = kind { *overlay_speed = value as f32; }
+            });
+            let overlay_cycle = spin_row(&grid, 34, "Overlay period in seconds (blink, pulse, wave; per typed character)", 0.05, 60.0, overlay_period as f64);
+            overlay_cycle.set_digits(2);
+            overlay_cycle.set_increments(0.05, 0.5);
+            connect_element_spin(&overlay_cycle, context.clone(), target.clone(), |kind, value| {
+                if let ElementKind::Gif { overlay_period, .. } = kind { *overlay_period = value as f32; }
+            });
+            let overlay_pause = spin_row(&grid, 35, "Overlay pause between passes in seconds", 0.0, MAX_SCROLL_PAUSE as f64, overlay_scroll_pause as f64);
+            connect_element_spin(&overlay_pause, context.clone(), target.clone(), |kind, value| {
+                if let ElementKind::Gif { overlay_scroll_pause, .. } = kind { *overlay_scroll_pause = value as f32; }
+            });
+            let inverted = check_row(&grid, 19, "Invert (light the dark pixels, darken the lit ones)", invert);
+            connect_element_check(&inverted, context.clone(), target.clone(), |kind, value| {
+                if let ElementKind::Gif { invert, .. } = kind { *invert = value; }
+            });
+            let own_area = check_row(&grid, 21, "Only the GIF's own area (the rest of the panel stays dark)", invert_gif_only);
+            own_area.set_margin_start(24);
+            own_area.set_sensitive(invert);
+            own_area.set_tooltip_text(Some(
+                "Invert only where the GIF is: its rectangle, or the sprite as it moves. Unticked, the whole panel around it lights up.",
+            ));
+            let own_area_toggle = own_area.clone();
+            inverted.connect_toggled(move |check| own_area_toggle.set_sensitive(check.is_active()));
+            connect_element_check(&own_area, context.clone(), target.clone(), |kind, value| {
+                if let ElementKind::Gif { invert_gif_only, .. } = kind { *invert_gif_only = value; }
+            });
+            let overlay_turn = spin_row(&grid, 30, "Overlay rotation ° (clockwise)", -360.0, 360.0, overlay_rotation as f64);
+            overlay_turn.set_tooltip_text(Some("Degrees to turn the overlay text about its middle; type any value"));
+            connect_element_spin(&overlay_turn, context.clone(), target.clone(), |kind, value| {
+                if let ElementKind::Gif { overlay_rotation, .. } = kind { *overlay_rotation = value as f32; }
             });
 
             let labels = GifLayout::ALL.map(GifLayout::label);
@@ -787,6 +1051,23 @@ fn element_card(
                 glib::idle_add_local_once(move || rebuild_profiles(&content, &context));
             });
 
+            offset_row(&grid, 17, (x_offset, y_offset), context.clone(), target.clone());
+            if layout != GifLayout::Animate {
+                let factor = spin_row(&grid, 20, "Scale (× the layout's size)", f64::from(MIN_GIF_SCALE), f64::from(MAX_GIF_SCALE), f64::from(scale));
+                factor.set_digits(2);
+                factor.set_increments(0.05, 0.5);
+                factor.set_tooltip_text(Some("1 keeps the size the layout picks; 2 doubles it, 0.5 halves it. Stays centred."));
+                connect_element_spin(&factor, context.clone(), target.clone(), |kind, value| {
+                    if let ElementKind::Gif { scale, .. } = kind { *scale = value as f32; }
+                });
+            }
+            let smoothing = check_row(&grid, 18, "Smooth GIF scaling (off keeps pixel art crisp)", smooth_scaling);
+            smoothing.set_tooltip_text(Some(
+                "Blend pixels when the GIF is scaled (Fit, Stretch, Animate size) or turned. Off picks the nearest pixel instead.",
+            ));
+            connect_element_check(&smoothing, context.clone(), target.clone(), |kind, value| {
+                if let ElementKind::Gif { smooth_scaling, .. } = kind { *smooth_scaling = value; }
+            });
             if layout == GifLayout::Animate {
                 let height = spin_row(&grid, 8, "Size (height in pixels)", 1.0, MAX_SPRITE_SIZE as f64, size as f64);
                 connect_element_spin(&height, context.clone(), target.clone(), |kind, value| {
@@ -828,7 +1109,6 @@ fn element_card(
                 connect_element_spin(&pause, context.clone(), target.clone(), |kind, value| {
                     if let ElementKind::Gif { scroll_pause, .. } = kind { *scroll_pause = value as f32; }
                 });
-                offset_row(&grid, 15, y_offset, context.clone(), target.clone());
                 safe_area_row(&grid, 16, ignore_safe_area, context, target);
             }
         }
@@ -840,7 +1120,7 @@ fn element_card(
                 if let ElementKind::Flashlight { brightness } = kind { *brightness = value as f32; }
             });
         }
-        ElementKind::Battery { font, font_size, style, label, y_offset, ignore_safe_area } => {
+        ElementKind::Battery { font, font_size, style, label, y_offset, x_offset, ignore_safe_area, scale } => {
             let labels = BatteryStyle::ALL.map(BatteryStyle::label);
             let selected = BatteryStyle::ALL.iter().position(|value| *value == style).unwrap_or(0);
             let look = dropdown_row(&grid, 0, "Style", &labels, selected);
@@ -857,15 +1137,23 @@ fn element_card(
             connect_element_entry(&font_entry, context.clone(), target.clone(), |kind, value| {
                 if let ElementKind::Battery { font, .. } = kind { *font = value.into(); }
             });
-            let size = spin_row(&grid, 3, "Font size", 6.0, 40.0, font_size as f64);
+            let size = spin_row(&grid, 3, "Font size", MIN_FONT_SIZE, 40.0, font_size as f64);
             connect_element_spin(&size, context.clone(), target.clone(), |kind, value| {
                 if let ElementKind::Battery { font_size, .. } = kind { *font_size = value as f32; }
             });
-            offset_row(&grid, 4, y_offset, context.clone(), target.clone());
+            offset_row(&grid, 4, (x_offset, y_offset), context.clone(), target.clone());
+            let factor = spin_row(&grid, 6, "Scale (× the whole gauge)", f64::from(MIN_BATTERY_SCALE), f64::from(MAX_BATTERY_SCALE), f64::from(scale));
+            factor.set_digits(2);
+            factor.set_increments(0.05, 0.25);
+            factor.set_tooltip_text(Some("Grows or shrinks the gauge, percentage, and label together about their middle"));
+            connect_element_spin(&factor, context.clone(), target.clone(), |kind, value| {
+                if let ElementKind::Battery { scale, .. } = kind { *scale = value as f32; }
+            });
             safe_area_row(&grid, 5, ignore_safe_area, context, target);
         }
     }
-    card.append(&grid);
+    body.append(&grid);
+    card.append(&body);
     frame.set_child(Some(&card));
     frame
 }
@@ -992,6 +1280,47 @@ fn settings_page(context: UiContext) -> gtk::ScrolledWindow {
     content.append(&menu_on_left);
     content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
+    let tilt = gtk::SpinButton::with_range(-2.0, 2.0, 0.05);
+    tilt.set_digits(2);
+    tilt.set_value(context.config.lock().map(|config| config.tilt_per_row).unwrap_or(0.5) as f64);
+    tilt.set_tooltip_text(Some(
+        "How far elements with Tilt compensation lean, in pixels per row. If they look more slanted, use the opposite sign.",
+    ));
+    let tilt_context = context.clone();
+    tilt.connect_value_changed(move |spin| {
+        let value = spin.value() as f32;
+        mutate_config(&tilt_context, false, |config| config.tilt_per_row = value);
+    });
+    content.append(&labelled("Tilt compensation (pixels per row)", &tilt));
+
+    let row_height = gtk::SpinButton::with_range(0.5, 1.5, 0.01);
+    row_height.set_digits(2);
+    row_height.set_value(context.config.lock().map_or(0.65, |config| config.preview_row_height) as f64);
+    row_height.set_tooltip_text(Some(
+        "How tall a row of LEDs looks on the lid compared with a column's width (1 = square), for the panel preview",
+    ));
+    let row_context = context.clone();
+    row_height.connect_value_changed(move |spin| {
+        let value = spin.value() as f32;
+        save_window_state(&row_context, |config| std::mem::replace(&mut config.preview_row_height, value) != value);
+    });
+    content.append(&labelled("Preview row height (1 = square)", &row_height));
+
+    let profile_fade = gtk::SpinButton::with_range(0.0, f64::from(MAX_TRANSITION), 0.1);
+    profile_fade.set_digits(1);
+    profile_fade.set_value(context.config.lock().map_or(0.0, |config| config.profile_fade) as f64);
+    profile_fade.set_tooltip_text(Some(
+        "Seconds to fade the shown profile out, then the next one in, when the active profile changes. \
+         An element's own fade out or (as first element) fade in is used instead where set. 0 switches at once.",
+    ));
+    let fade_context = context.clone();
+    profile_fade.connect_value_changed(move |spin| {
+        let value = spin.value() as f32;
+        mutate_config(&fade_context, false, |config| config.profile_fade = value);
+    });
+    content.append(&labelled("Profile switch fade (seconds, 0 = off)", &profile_fade));
+    content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+
     let powersave = gtk::CheckButton::with_label("Enable built-in powersave animation");
     powersave.set_active(snapshot.powersave_animation);
     content.append(&powersave);
@@ -1054,12 +1383,13 @@ fn file_row(grid: &gtk::Grid, row: i32, label: &str, value: &str, kind: FileKind
                 ("Choose a font", Some(current), PathBuf::from("/usr/share/fonts"))
             }
             FileKind::Gif => {
-                filter.set_name(Some("GIF animations"));
-                filter.add_pattern("*.gif");
-                filter.add_pattern("*.GIF");
+                filter.set_name(Some("GIFs and images"));
+                for pattern in ["*.gif", "*.GIF", "*.png", "*.PNG", "*.jpg", "*.JPG", "*.jpeg", "*.JPEG"] {
+                    filter.add_pattern(pattern);
+                }
                 let bundled = animatrix::assets::gif_dirs().into_iter().next();
                 let fallback = bundled.or_else(|| std::env::var_os("HOME").map(PathBuf::from)).unwrap_or_default();
-                ("Choose a GIF", animatrix::assets::resolve_gif(&current), fallback)
+                ("Choose a GIF or image", animatrix::assets::resolve_gif(&current), fallback)
             }
         };
         // Start next to the current file when there is one.
@@ -1105,37 +1435,90 @@ fn dropdown_row(grid: &gtk::Grid, row: i32, label: &str, options: &[&str], selec
     dropdown
 }
 
-/// "Cycles" checkbox with its play count, shared by text and GIF elements.
-/// The count only applies while the box is ticked.
-fn plays_row(grid: &gtk::Grid, row: i32, limit: bool, plays: u32, context: UiContext, target: ElementTarget) {
-    let check = gtk::CheckButton::with_label("Cycles");
-    check.set_active(limit);
-    check.set_tooltip_text(Some(
-        "Plays before moving on, when the profile cycles \"after animation cycles finish\"",
+/// "Shown for N seconds / cycles": how long the element stays when its
+/// profile shows one element at a time. Only text and GIFs have animation
+/// cycles to count.
+/// Below it, the element's fades and the pause after it.
+fn turn_row(context: &UiContext, target: &ElementTarget, element: &Element) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let turn = element.turn.unwrap_or_default();
+    let (count, cycles) = match turn {
+        TurnLength::Seconds(seconds) => (seconds, false),
+        TurnLength::Cycles(plays) => (plays, true),
+    };
+    let amount = gtk::SpinButton::with_range(1.0, 3600.0, 1.0);
+    amount.set_value(f64::from(count));
+    let can_cycle = matches!(element.kind, ElementKind::Text { .. } | ElementKind::Gif { .. });
+    let unit = gtk::DropDown::from_strings(&["seconds", "cycles"]);
+    unit.set_selected(u32::from(cycles && can_cycle));
+    unit.set_tooltip_text(Some(
+        "Cycles: complete plays of the animation (a scroll pass, a GIF loop, …). Static text and still images count one second per cycle.",
     ));
-    let count = gtk::SpinButton::with_range(1.0, 999.0, 1.0);
-    count.set_value(plays as f64);
-    count.set_sensitive(limit);
-    grid.attach(&check, 0, row, 1, 1);
-    grid.attach(&count, 1, row, 1, 1);
+    // Read both widgets, so either change saves the whole turn.
+    let save = {
+        let (context, target, amount, unit) = (context.clone(), target.clone(), amount.clone(), unit.clone());
+        move || {
+            let count = amount.value() as u32;
+            let turn = if unit.selected() == 1 { TurnLength::Cycles(count) } else { TurnLength::Seconds(count) };
+            mutate_profile(&context, &target.profile, |profile| {
+                if let Some(element) = profile.element_mut(&target.element) {
+                    element.turn = Some(turn);
+                }
+            });
+        }
+    };
+    let save = Rc::new(save);
+    let on_amount = Rc::clone(&save);
+    amount.connect_value_changed(move |_| on_amount());
+    unit.connect_selected_notify(move |_| save());
+    row.append(&gtk::Label::new(Some("Shown for")));
+    row.append(&amount);
+    if can_cycle {
+        row.append(&unit);
+    } else {
+        row.append(&gtk::Label::new(Some("seconds")));
+    }
 
-    let count_for_check = count.clone();
-    connect_element_check(&check, context.clone(), target.clone(), move |kind, value| {
-        count_for_check.set_sensitive(value);
-        if let ElementKind::Text { limit_plays, .. } | ElementKind::Gif { limit_plays, .. } = kind {
-            *limit_plays = value;
-        }
-    });
-    connect_element_spin(&count, context, target, |kind, value| {
-        if let ElementKind::Text { plays, .. } | ElementKind::Gif { plays, .. } = kind {
-            *plays = value as u32;
-        }
-    });
+    // Fades within the turn, then a dark pause before the next element.
+    let transition_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    type Field = fn(&mut Transition) -> &mut f32;
+    let fields: [(&str, &str, f32, Field); 3] = [
+        ("fade in", "Seconds to brighten from dark at the start of its turn", element.transition.fade_in, |t| &mut t.fade_in),
+        ("fade out", "Seconds to dim to dark at the end of its turn", element.transition.fade_out, |t| &mut t.fade_out),
+        ("pause after", "Seconds of dark panel before the next element", element.transition.pause, |t| &mut t.pause),
+    ];
+    for (label, tooltip, value, field) in fields {
+        let spin = gtk::SpinButton::with_range(0.0, f64::from(MAX_TRANSITION), 0.1);
+        spin.set_digits(1);
+        spin.set_value(f64::from(value));
+        spin.set_tooltip_text(Some(tooltip));
+        let (context, target) = (context.clone(), target.clone());
+        spin.connect_value_changed(move |spin| {
+            let value = spin.value() as f32;
+            mutate_profile(&context, &target.profile, |profile| {
+                if let Some(element) = profile.element_mut(&target.element) {
+                    *field(&mut element.transition) = value;
+                }
+            });
+        });
+        transition_row.append(&gtk::Label::new(Some(label)));
+        transition_row.append(&spin);
+    }
+    transition_row.append(&gtk::Label::new(Some("seconds")));
+
+    let rows = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    rows.append(&row);
+    rows.append(&transition_row);
+    rows
 }
 
 /// "Ignore safe area" checkbox shared by every element that lays out content.
 fn safe_area_row(grid: &gtk::Grid, row: i32, value: bool, context: UiContext, target: ElementTarget) {
     let check = check_row(grid, row, "Ignore safe area (may clip at the panel edges)", value);
+    check.set_tooltip_text(Some(
+        "Lay out on the whole canvas. Clocks and text then scale to fill it and ignore the font size; \
+         unticked, they keep the font size, centred on the guaranteed-visible area.",
+    ));
     connect_element_check(&check, context, target, |kind, value| {
         if let ElementKind::Clock { ignore_safe_area, .. }
         | ElementKind::Text { ignore_safe_area, .. }
@@ -1147,18 +1530,31 @@ fn safe_area_row(grid: &gtk::Grid, row: i32, value: bool, context: UiContext, ta
     });
 }
 
-/// "Vertical offset" editor shared by the text-like elements.
-fn offset_row(grid: &gtk::Grid, row: i32, value: i32, context: UiContext, target: ElementTarget) {
-    let spin = spin_row(grid, row, "Vertical offset (pixels, negative moves up)", -40.0, 40.0, value as f64);
-    connect_element_spin(&spin, context, target, |kind, value| {
-        if let ElementKind::Clock { y_offset, .. }
-        | ElementKind::Text { y_offset, .. }
-        | ElementKind::Battery { y_offset, .. }
-        | ElementKind::Gif { y_offset, .. } = kind
-        {
-            *y_offset = value as i32;
-        }
-    });
+/// Smallest font size the editors offer; tiny sizes suit pixel fonts.
+const MIN_FONT_SIZE: f64 = 1.0;
+
+/// Offset editor shared by the text-like elements: right and down, in
+/// pixels.
+fn offset_row(grid: &gtk::Grid, row: i32, (x, y): (i32, i32), context: UiContext, target: ElementTarget) {
+    let spins = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    for (label, value, horizontal) in [("→", x, true), ("↓", y, false)] {
+        let spin = gtk::SpinButton::with_range(-74.0, 74.0, 1.0);
+        spin.set_value(value as f64);
+        spin.set_tooltip_text(Some(if horizontal { "Pixels right; negative moves left" } else { "Pixels down; negative moves up" }));
+        connect_element_spin(&spin, context.clone(), target.clone(), move |kind, value| {
+            if let ElementKind::Clock { x_offset, y_offset, .. }
+            | ElementKind::Text { x_offset, y_offset, .. }
+            | ElementKind::Battery { x_offset, y_offset, .. }
+            | ElementKind::Gif { x_offset, y_offset, .. } = kind
+            {
+                *(if horizontal { x_offset } else { y_offset }) = value as i32;
+            }
+        });
+        spins.append(&gtk::Label::new(Some(label)));
+        spins.append(&spin);
+    }
+    grid.attach(&gtk::Label::builder().label("Offset (pixels)").xalign(0.0).build(), 0, row, 1, 1);
+    grid.attach(&spins, 1, row, 1, 1);
 }
 
 fn check_row(grid: &gtk::Grid, row: i32, label: &str, value: bool) -> gtk::CheckButton {
@@ -1173,6 +1569,35 @@ fn labelled<W: IsA<gtk::Widget>>(text: &str, widget: &W) -> gtk::Box {
     row.append(&gtk::Label::builder().label(text).xalign(0.0).hexpand(true).build());
     row.append(widget);
     row
+}
+
+/// A multi-line text box: Enter starts a new line, and it grows with them.
+fn text_area_row(grid: &gtk::Grid, row: i32, label: &str, value: &str) -> gtk::TextBuffer {
+    let buffer = gtk::TextBuffer::new(None);
+    buffer.set_text(value);
+    let view = gtk::TextView::builder()
+        .buffer(&buffer)
+        .accepts_tab(false)
+        .hexpand(true)
+        .top_margin(6)
+        .bottom_margin(6)
+        .left_margin(8)
+        .right_margin(8)
+        .build();
+    let frame = gtk::Frame::builder().child(&view).build();
+    grid.attach(&gtk::Label::builder().label(label).xalign(0.0).valign(gtk::Align::Start).margin_top(6).build(), 0, row, 1, 1);
+    grid.attach(&frame, 1, row, 1, 1);
+    buffer
+}
+
+fn connect_element_text<F>(buffer: &gtk::TextBuffer, context: UiContext, target: ElementTarget, update: F)
+where
+    F: Fn(&mut ElementKind, String) + 'static,
+{
+    buffer.connect_changed(move |buffer| {
+        let value = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string();
+        mutate_element(&context, &target, |kind| update(kind, value));
+    });
 }
 
 fn connect_element_entry<F>(entry: &gtk::Entry, context: UiContext, target: ElementTarget, update: F)
@@ -1241,16 +1666,172 @@ fn remember_window_size(context: &UiContext, window: &gtk::ApplicationWindow) {
     // While maximized, the default size still holds the unmaximized one.
     let (width, height) = window.default_size();
     let state = WindowState { width, height, maximized: window.is_maximized() };
+    save_window_state(context, |config| config.window.replace(state) != Some(state));
+}
+
+/// Saves window-only settings (size, preview) without refreshing the
+/// engine; nothing on the panel depends on them. `update` says whether it
+/// changed anything.
+fn save_window_state(context: &UiContext, update: impl FnOnce(&mut AppConfig) -> bool) {
     let snapshot = match context.config.lock() {
-        Ok(mut config) if config.window != Some(state) => {
-            config.window = Some(state);
+        Ok(mut config) => {
+            if !update(&mut config) {
+                return;
+            }
             config.clone()
         }
-        _ => return,
+        Err(_) => return,
     };
     if let Err(error) = context.store.save(&snapshot) {
-        eprintln!("animatrix: failed to save window size: {error:#}");
+        eprintln!("animatrix: failed to save window state: {error:#}");
     }
+}
+
+/// The panel preview in the bottom bar: a drag handle and a drawing of the
+/// LEDs above the status line, and the toggle that shows them.
+#[derive(Clone)]
+struct PanelPreview {
+    handle: gtk::Box,
+    area: gtk::DrawingArea,
+    toggle: gtk::ToggleButton,
+    /// Polls the engine for new frames while the preview is on screen.
+    timer: Rc<RefCell<Option<glib::SourceId>>>,
+    engine: EngineHandle,
+    frame: Rc<RefCell<animatrix::PanelFrame>>,
+    /// The row height last drawn with; the setting is checked while polling.
+    row_height: Rc<std::cell::Cell<f32>>,
+    config: Arc<Mutex<AppConfig>>,
+}
+
+impl PanelPreview {
+    const MIN_HEIGHT: i32 = 60;
+    const MAX_HEIGHT: i32 = 480;
+    /// About the panel's own top speed; nothing is redrawn without a new frame.
+    const POLL: Duration = Duration::from_millis(33);
+
+    fn set_running(&self, running: bool) {
+        if let Some(source) = self.timer.take() {
+            source.remove();
+        }
+        if !running {
+            return;
+        }
+        let preview = self.clone();
+        let poll = move || {
+            let seen = preview.frame.borrow().serial;
+            if let Some(frame) = preview.engine.frame_after(seen) {
+                *preview.frame.borrow_mut() = frame;
+                preview.area.queue_draw();
+            }
+            // Picks up a change on the Settings tab while the panel is still.
+            if let Ok(row_height) = preview.config.lock().map(|config| config.preview_row_height)
+                && preview.row_height.replace(row_height) != row_height
+            {
+                preview.area.queue_draw();
+            }
+        };
+        poll();
+        self.timer.replace(Some(glib::timeout_add_local(Self::POLL, move || {
+            poll();
+            glib::ControlFlow::Continue
+        })));
+    }
+
+    /// The tallest the preview may get: its limit, and at most most of the
+    /// window so the tabs stay usable.
+    fn max_height(&self) -> i32 {
+        let window = self.area.root().map_or(0, |root| root.height());
+        if window > 0 { Self::MAX_HEIGHT.min(window * 3 / 5).max(Self::MIN_HEIGHT) } else { Self::MAX_HEIGHT }
+    }
+}
+
+fn panel_preview(context: &UiContext) -> PanelPreview {
+    let (shown, height) = context.config.lock().map(|config| (config.preview_shown, config.preview_height)).unwrap_or((false, 160));
+    let area = gtk::DrawingArea::builder()
+        .content_height(height.clamp(PanelPreview::MIN_HEIGHT, PanelPreview::MAX_HEIGHT))
+        .visible(shown)
+        .build();
+    let handle = gtk::Box::builder().height_request(8).visible(shown).tooltip_text("Drag to resize the preview").build();
+    handle.append(&gtk::Separator::builder().hexpand(true).valign(gtk::Align::Center).build());
+    handle.set_cursor_from_name(Some("row-resize"));
+    let toggle = gtk::ToggleButton::builder().label("Preview").active(shown).tooltip_text("Show what the panel is displaying").build();
+    let preview = PanelPreview {
+        handle,
+        area,
+        toggle,
+        timer: Rc::default(),
+        engine: context.engine.clone(),
+        frame: Rc::default(),
+        row_height: Rc::new(std::cell::Cell::new(context.config.lock().map_or(0.65, |config| config.preview_row_height))),
+        config: Arc::clone(&context.config),
+    };
+
+    // LEDs drawn where they sit on the canvas, so the drawing has the
+    // panel's shape, turned the way the panel sits on the lid (short
+    // straight edge along the top on the GA402); unlit ones stay faintly
+    // visible. Rows on the lid sit closer together than columns, so the
+    // turned drawing is squashed by the Settings tab's row height.
+    const TURN_DEGREES: f64 = 45.0;
+    let geometry = MatrixGeometry::detect();
+    let (sin, cos) = TURN_DEGREES.to_radians().sin_cos();
+    let turned: Vec<Option<(f64, f64)>> = animatrix::matrix::led_positions(geometry)
+        .into_iter()
+        .map(|position| position.map(|(x, y)| (f64::from(x), f64::from(y))).map(|(x, y)| (x * cos - y * sin, x * sin + y * cos)))
+        .collect();
+    let (mut min, mut max) = ((f64::MAX, f64::MAX), (f64::MIN, f64::MIN));
+    for &(x, y) in turned.iter().flatten() {
+        (min, max) = ((min.0.min(x), min.1.min(y)), (max.0.max(x), max.1.max(y)));
+    }
+    let (frame, row_height) = (Rc::clone(&preview.frame), Rc::clone(&preview.row_height));
+    preview.area.set_draw_func(move |_, cairo, width, height| {
+        cairo.set_source_rgb(0.04, 0.04, 0.05);
+        let _ = cairo.paint();
+        let squash = f64::from(row_height.get());
+        // One cell of room around the outermost LED centres.
+        let (columns, rows) = (max.0 - min.0 + 1.0, (max.1 - min.1) * squash + 1.0);
+        let cell = (f64::from(width) / columns).min(f64::from(height) / rows);
+        let left = (f64::from(width) - cell * columns) / 2.0;
+        let top = (f64::from(height) - cell * rows) / 2.0;
+        // Squashed, neighbours can be under a cell apart.
+        let radius = (cell * 0.45 * squash.min(1.0)).max(0.6);
+        let frame = frame.borrow();
+        for (index, position) in turned.iter().enumerate() {
+            let Some((x, y)) = *position else { continue };
+            let level = f64::from(frame.leds.get(index).copied().unwrap_or(0)) / 255.0;
+            let shade = 0.13 + 0.87 * level;
+            cairo.set_source_rgb(shade, shade, shade * 0.97);
+            let (cx, cy) = (left + (x - min.0 + 0.5) * cell, top + ((y - min.1) * squash + 0.5) * cell);
+            cairo.arc(cx, cy, radius, 0.0, std::f64::consts::TAU);
+            let _ = cairo.fill();
+        }
+    });
+
+    // Dragging the handle up makes the preview taller, within its limits.
+    let drag = gtk::GestureDrag::new();
+    let start_height = Rc::new(std::cell::Cell::new(0));
+    let (begin_preview, begin_start) = (preview.clone(), Rc::clone(&start_height));
+    drag.connect_drag_begin(move |_, _, _| begin_start.set(begin_preview.area.content_height()));
+    let (update_preview, update_start) = (preview.clone(), Rc::clone(&start_height));
+    drag.connect_drag_update(move |_, _, dy| {
+        let height = (update_start.get() - dy as i32).clamp(PanelPreview::MIN_HEIGHT, update_preview.max_height());
+        update_preview.area.set_content_height(height);
+    });
+    let (end_preview, end_context) = (preview.clone(), context.clone());
+    drag.connect_drag_end(move |_, _, _| {
+        let height = end_preview.area.content_height();
+        save_window_state(&end_context, |config| std::mem::replace(&mut config.preview_height, height) != height);
+    });
+    preview.handle.add_controller(drag);
+
+    let (toggle_preview, toggle_context) = (preview.clone(), context.clone());
+    preview.toggle.connect_toggled(move |toggle| {
+        let shown = toggle.is_active();
+        toggle_preview.area.set_visible(shown);
+        toggle_preview.handle.set_visible(shown);
+        toggle_preview.set_running(shown);
+        save_window_state(&toggle_context, |config| std::mem::replace(&mut config.preview_shown, shown) != shown);
+    });
+    preview
 }
 
 fn mutate_config<F>(context: &UiContext, policy_changed: bool, update: F)

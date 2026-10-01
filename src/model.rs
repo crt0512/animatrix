@@ -97,9 +97,27 @@ pub struct AppConfig {
     /// show, instead of the other way round.
     #[serde(default)]
     pub tray_menu_on_left_click: bool,
+    /// Pixels per canvas row that elements with tilt compensation are
+    /// shifted sideways, against the panel's row offset that makes upright
+    /// strokes lean. Positive moves rows above an element's middle left.
+    #[serde(default = "default_tilt_per_row")]
+    pub tilt_per_row: f32,
+    /// Seconds to fade the shown profile out and the next one in when the
+    /// active profile changes; elements' own fades take precedence.
+    #[serde(default)]
+    pub profile_fade: f32,
     /// Main window size when it was last closed; `None` until then.
     #[serde(default)]
     pub window: Option<WindowState>,
+    /// The panel preview in the window's bottom bar, and its height in pixels.
+    #[serde(default)]
+    pub preview_shown: bool,
+    #[serde(default = "default_preview_height")]
+    pub preview_height: i32,
+    /// How tall a row of LEDs is on the lid compared with a column's width,
+    /// for drawing the preview to the panel's real proportions.
+    #[serde(default = "default_preview_row_height")]
+    pub preview_row_height: f32,
     #[serde(default)]
     pub triggers: ProfileTriggers,
 }
@@ -118,20 +136,22 @@ pub struct WindowState {
 /// pointing at deleted profiles are ignored.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileTriggers {
+    /// Plugging in with the lid open.
     #[serde(default)]
     pub plugged_in: Trigger,
+    /// Unplugging with the lid open.
     #[serde(default)]
     pub unplugged: Trigger,
     #[serde(default)]
     pub lid_closed: Trigger,
     #[serde(default)]
     pub lid_opened: Trigger,
-    /// Entering "lid closed while on mains power", by either change.
+    /// Plugging in with the lid closed.
+    #[serde(default, alias = "lid_closed_plugged_in")]
+    pub closed_plugged_in: Trigger,
+    /// Unplugging with the lid closed.
     #[serde(default)]
-    pub lid_closed_plugged_in: Trigger,
-    /// Entering "lid open while on mains power", by either change.
-    #[serde(default)]
-    pub lid_opened_plugged_in: Trigger,
+    pub closed_unplugged: Trigger,
 }
 
 impl ProfileTriggers {
@@ -141,8 +161,8 @@ impl ProfileTriggers {
             &self.unplugged,
             &self.lid_closed,
             &self.lid_opened,
-            &self.lid_closed_plugged_in,
-            &self.lid_opened_plugged_in,
+            &self.closed_plugged_in,
+            &self.closed_unplugged,
         ]
     }
 
@@ -153,8 +173,8 @@ impl ProfileTriggers {
             &mut self.unplugged,
             &mut self.lid_closed,
             &mut self.lid_opened,
-            &mut self.lid_closed_plugged_in,
-            &mut self.lid_opened_plugged_in,
+            &mut self.closed_plugged_in,
+            &mut self.closed_unplugged,
         ] {
             if trigger.profile.as_deref() == Some(id) {
                 trigger.profile = None;
@@ -202,22 +222,63 @@ impl From<TriggerConfig> for Trigger {
     }
 }
 
-/// Rotation through a profile's elements, one at a time.
+/// Rotation through a profile's elements, one at a time; each element sets
+/// how long it stays with its [`TurnLength`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CycleSettings {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default = "default_cycle_seconds")]
+    /// Start over after the last element; off, the last one stays.
+    #[serde(default = "default_true")]
+    pub repeat: bool,
+    /// Older configurations set one interval for the whole profile; only
+    /// read to give their elements a turn length.
+    #[serde(default = "default_cycle_seconds", skip_serializing)]
     pub seconds: u32,
-    /// Elements with a play limit stay until they have played that many
-    /// times instead of for `seconds`.
-    #[serde(default)]
+    /// Older configurations: elements with a play limit stayed for that many
+    /// plays instead of `seconds`.
+    #[serde(default, skip_serializing)]
     pub after_animations: bool,
 }
 
+/// How long an element stays when its profile shows one element at a time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnLength {
+    Seconds(u32),
+    /// Complete plays of its animation; only text and GIFs have one.
+    Cycles(u32),
+}
+
+impl Default for TurnLength {
+    fn default() -> Self {
+        Self::Seconds(DEFAULT_TURN_SECONDS)
+    }
+}
+
+/// How an element comes and goes when its profile shows one element at a
+/// time, in seconds: brightness ramps up over `fade_in` from the start of
+/// its turn and down over `fade_out` to its end, then the panel stays dark
+/// for `pause` before the next element.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Transition {
+    #[serde(default)]
+    pub fade_in: f32,
+    #[serde(default)]
+    pub fade_out: f32,
+    #[serde(default)]
+    pub pause: f32,
+}
+
+/// Longest fade or pause, in seconds.
+pub const MAX_TRANSITION: f32 = 60.0;
+
+/// A new element's turn, and the fallback for cycles with nothing to play.
+pub const DEFAULT_TURN_SECONDS: u32 = 10;
+
 impl Default for CycleSettings {
     fn default() -> Self {
-        Self { enabled: false, seconds: default_cycle_seconds(), after_animations: false }
+        Self { enabled: false, repeat: true, seconds: default_cycle_seconds(), after_animations: false }
     }
 }
 
@@ -235,7 +296,12 @@ impl Default for AppConfig {
             policy: DevicePolicy::default(),
             invert_tray_icon: false,
             tray_menu_on_left_click: false,
+            tilt_per_row: default_tilt_per_row(),
+            profile_fade: 0.0,
             window: None,
+            preview_shown: false,
+            preview_height: default_preview_height(),
+            preview_row_height: default_preview_row_height(),
             triggers: ProfileTriggers::default(),
         }
     }
@@ -282,13 +348,17 @@ impl DisplayProfile {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.cycle.seconds == 0 {
-            bail!("profile '{}' element cycle interval must be at least one second", self.name);
-        }
         for element in &self.elements {
             element.validate().with_context(|| format!("profile '{}'", self.name))?;
         }
         Ok(())
+    }
+
+    /// An independent copy: same elements and settings, new ids, the name
+    /// marked as a copy.
+    pub fn duplicate(&self) -> Self {
+        let elements = self.elements.iter().map(Element::duplicate).collect();
+        Self { id: new_id(), name: format!("{} (copy)", self.name), elements, cycle: self.cycle.clone() }
     }
 
     pub fn element_mut(&mut self, id: &str) -> Option<&mut Element> {
@@ -314,9 +384,18 @@ enum StoredProfile {
 impl From<StoredProfile> for DisplayProfile {
     fn from(stored: StoredProfile) -> Self {
         match stored {
-            StoredProfile::Group { id, name, elements, cycle } => Self { id, name, elements, cycle },
+            StoredProfile::Group { id, name, mut elements, cycle } => {
+                // Older configurations timed turns per profile.
+                for element in &mut elements {
+                    element.turn.get_or_insert(match element.kind.play_limit() {
+                        Some(plays) if cycle.after_animations => TurnLength::Cycles(plays),
+                        _ => TurnLength::Seconds(cycle.seconds.max(1)),
+                    });
+                }
+                Self { id, name, elements, cycle }
+            }
             StoredProfile::Single { id, name, kind } => {
-                let element = Element { id: new_id(), kind };
+                let element = Element { id: new_id(), rotation: 0.0, tilt_compensation: false, smooth_text: true, turn: Some(TurnLength::default()), transition: Transition::default(), kind };
                 Self { id, name, elements: vec![element], cycle: CycleSettings::default() }
             }
         }
@@ -327,14 +406,43 @@ impl From<StoredProfile> for DisplayProfile {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Element {
     pub id: String,
+    /// Degrees to turn the element clockwise. Not offered for the
+    /// flashlight, which looks the same either way. Read from the older
+    /// `flipped` switch too (on = 180).
+    #[serde(default, alias = "flipped", deserialize_with = "rotation_degrees")]
+    pub rotation: f32,
+    /// Lean the element against the panel's row shift, by
+    /// [`AppConfig::tilt_per_row`].
+    #[serde(default)]
+    pub tilt_compensation: bool,
+    /// Anti-aliased font edges; off draws each pixel fully on or off.
+    #[serde(default = "default_true")]
+    pub smooth_text: bool,
+    /// How long it stays when its profile shows one element at a time;
+    /// `None` only until an older configuration has been converted.
+    #[serde(default)]
+    pub turn: Option<TurnLength>,
+    /// Fades and a dark pause around its turn, likewise.
+    #[serde(default)]
+    pub transition: Transition,
     #[serde(flatten)]
     pub kind: ElementKind,
 }
 
 impl Element {
+    /// An identical copy with its own id.
+    pub fn duplicate(&self) -> Self {
+        Self { id: new_id(), ..self.clone() }
+    }
+
     pub fn clock() -> Self {
         Self {
             id: new_id(),
+            rotation: 0.0,
+            tilt_compensation: false,
+            smooth_text: true,
+            turn: Some(TurnLength::default()),
+            transition: Transition::default(),
             kind: ElementKind::Clock {
                 font: default_font(),
                 font_size: 15.0,
@@ -345,7 +453,10 @@ impl Element {
                 show_millis: false,
                 fps: default_clock_fps(),
                 y_offset: 0,
+                x_offset: 0,
                 ignore_safe_area: false,
+                date_first: false,
+                millis_digits: default_millis_digits(),
             },
         }
     }
@@ -353,6 +464,11 @@ impl Element {
     pub fn text() -> Self {
         Self {
             id: new_id(),
+            rotation: 0.0,
+            tilt_compensation: false,
+            smooth_text: true,
+            turn: Some(TurnLength::default()),
+            transition: Transition::default(),
             kind: ElementKind::Text {
                 text: "Hello, AniMe Matrix!".into(),
                 font: default_font(),
@@ -365,8 +481,12 @@ impl Element {
                 direction: ScrollDirection::Left,
                 period: default_text_period(),
                 y_offset: 0,
+                x_offset: 0,
                 limit_plays: false,
                 plays: default_plays(),
+                outline: 0,
+                color: OverlayColor::White,
+                invert: false,
             },
         }
     }
@@ -374,6 +494,11 @@ impl Element {
     pub fn gif() -> Self {
         Self {
             id: new_id(),
+            rotation: 0.0,
+            tilt_compensation: false,
+            smooth_text: true,
+            turn: Some(TurnLength::default()),
+            transition: Transition::default(),
             kind: ElementKind::Gif {
                 path: PathBuf::from(crate::assets::DEFAULT_GIF),
                 brightness: 1.0,
@@ -393,6 +518,7 @@ impl Element {
                 scroll_pause: 0.0,
                 ignore_safe_area: false,
                 y_offset: 0,
+                x_offset: 0,
                 overlay_text: String::new(),
                 overlay_color: OverlayColor::White,
                 overlay_font: default_font(),
@@ -400,6 +526,18 @@ impl Element {
                 overlay_bold: false,
                 overlay_italic: false,
                 overlay_outline: 0,
+                overlay_x_offset: 0,
+                overlay_y_offset: 0,
+                overlay_rotation: 0.0,
+                overlay_mode: TextMode::Static,
+                overlay_direction: ScrollDirection::Left,
+                overlay_speed: default_overlay_speed(),
+                overlay_period: default_text_period(),
+                overlay_scroll_pause: 0.0,
+                invert: false,
+                invert_gif_only: false,
+                smooth_scaling: true,
+                scale: default_gif_scale(),
             },
         }
     }
@@ -407,6 +545,11 @@ impl Element {
     pub fn flashlight() -> Self {
         Self {
             id: new_id(),
+            rotation: 0.0,
+            tilt_compensation: false,
+            smooth_text: true,
+            turn: Some(TurnLength::default()),
+            transition: Transition::default(),
             kind: ElementKind::Flashlight { brightness: 1.0 },
         }
     }
@@ -414,27 +557,44 @@ impl Element {
     pub fn battery() -> Self {
         Self {
             id: new_id(),
+            rotation: 0.0,
+            tilt_compensation: false,
+            smooth_text: true,
+            turn: Some(TurnLength::default()),
+            transition: Transition::default(),
             kind: ElementKind::Battery {
                 font: default_font(),
                 font_size: 11.0,
                 style: BatteryStyle::Classic,
                 label: String::new(),
                 y_offset: 0,
+                x_offset: 0,
                 ignore_safe_area: false,
+                scale: default_battery_scale(),
             },
         }
     }
 
     pub fn validate(&self) -> Result<()> {
+        let Transition { fade_in, fade_out, pause } = self.transition;
+        if [fade_in, fade_out, pause].iter().any(|seconds| !(0.0..=MAX_TRANSITION).contains(seconds)) {
+            bail!("fades and pauses must be between 0 and {MAX_TRANSITION} seconds");
+        }
         match &self.kind {
-            ElementKind::Clock { font, font_size, fps, .. } => {
+            ElementKind::Clock { font, font_size, fps, millis_digits, .. } => {
                 validate_font(font, *font_size)?;
                 if !(1.0..=MAX_FPS).contains(fps) {
                     bail!("clock element FPS must be between 1 and {MAX_FPS}");
                 }
+                if !(1..=3).contains(millis_digits) {
+                    bail!("clock element must show 1 to 3 digits of milliseconds");
+                }
             }
-            ElementKind::Battery { font, font_size, .. } => {
+            ElementKind::Battery { font, font_size, scale, .. } => {
                 validate_font(font, *font_size)?;
+                if !(MIN_BATTERY_SCALE..=MAX_BATTERY_SCALE).contains(scale) {
+                    bail!("battery element scale must be between {MIN_BATTERY_SCALE} and {MAX_BATTERY_SCALE}");
+                }
             }
             ElementKind::Text {
                 text,
@@ -444,10 +604,14 @@ impl Element {
                 fps,
                 scroll_pause,
                 period,
+                outline,
                 ..
             } => {
                 if text.is_empty() {
                     bail!("text element has no text");
+                }
+                if *outline > MAX_OUTLINE {
+                    bail!("text element outline must be at most {MAX_OUTLINE} pixels");
                 }
                 validate_font(font, *font_size)?;
                 if *speed <= 0.0 {
@@ -464,14 +628,26 @@ impl Element {
                 }
             }
             ElementKind::Gif {
-                path, brightness, contrast, black_level, fps, size, speed, motion_fps, period, scroll_pause, overlay_text,
-                overlay_font, overlay_size, overlay_outline, ..
+                path, brightness, contrast, black_level, fps, size, speed, motion_fps, period, scroll_pause, overlay_text, scale,
+                overlay_font, overlay_size, overlay_outline, overlay_speed, overlay_period, overlay_scroll_pause, ..
             } => {
                 if *overlay_outline > MAX_OUTLINE {
                     bail!("GIF element outline must be at most {MAX_OUTLINE} pixels");
                 }
                 if !overlay_text.is_empty() {
                     validate_font(overlay_font, *overlay_size)?;
+                    if *overlay_speed <= 0.0 {
+                        bail!("GIF overlay must have a positive speed");
+                    }
+                    if !(0.05..=60.0).contains(overlay_period) {
+                        bail!("GIF overlay animation period must be between 0.05 and 60 seconds");
+                    }
+                    if !(0.0..=MAX_SCROLL_PAUSE).contains(overlay_scroll_pause) {
+                        bail!("GIF overlay pause must be between 0 and {MAX_SCROLL_PAUSE} seconds");
+                    }
+                }
+                if !(MIN_GIF_SCALE..=MAX_GIF_SCALE).contains(scale) {
+                    bail!("GIF element scale must be between {MIN_GIF_SCALE} and {MAX_GIF_SCALE}");
                 }
                 if !(1..=MAX_SPRITE_SIZE).contains(size) {
                     bail!("GIF element size must be between 1 and {MAX_SPRITE_SIZE} pixels");
@@ -489,11 +665,9 @@ impl Element {
                     bail!("GIF element pause must be between 0 and {MAX_SCROLL_PAUSE} seconds");
                 }
                 // An empty or missing file falls back to a bundled GIF.
-                if !path.as_os_str().is_empty()
-                    && path.extension().and_then(|value| value.to_str()).map(str::to_lowercase)
-                        != Some("gif".into())
-                {
-                    bail!("GIF element must reference a .gif file");
+                let extension = path.extension().and_then(|value| value.to_str()).map(str::to_lowercase);
+                if !path.as_os_str().is_empty() && !matches!(extension.as_deref(), Some("gif" | "png" | "jpg" | "jpeg")) {
+                    bail!("GIF/Image element must reference a .gif, .png, .jpg, or .jpeg file");
                 }
                 if !(0.0..=MAX_GIF_BRIGHTNESS).contains(brightness) {
                     bail!("GIF element brightness must be between 0 and {MAX_GIF_BRIGHTNESS}");
@@ -536,9 +710,18 @@ pub enum ElementKind {
         /// Pixels to move the element down (negative: up).
         #[serde(default)]
         y_offset: i32,
+        /// Pixels to move the element right (negative: left).
+        #[serde(default)]
+        x_offset: i32,
         /// Lay out on the whole canvas instead of the guaranteed-visible area.
         #[serde(default)]
         ignore_safe_area: bool,
+        /// How many digits of the milliseconds to show (1–3).
+        #[serde(default = "default_millis_digits")]
+        millis_digits: u8,
+        /// Draw the date above the time instead of below it.
+        #[serde(default)]
+        date_first: bool,
     },
     Text {
         text: String,
@@ -565,11 +748,26 @@ pub enum ElementKind {
         /// Pixels to move the element down (negative: up).
         #[serde(default)]
         y_offset: i32,
-        /// Whether element cycling waits for `plays` complete animations.
+        /// Pixels to move the element right (negative: left).
         #[serde(default)]
+        x_offset: i32,
+        /// Older configurations: whether element cycling waited for `plays`
+        /// complete animations; only read to give the element its turn.
+        #[serde(default, skip_serializing)]
         limit_plays: bool,
-        #[serde(default = "default_plays")]
+        #[serde(default = "default_plays", skip_serializing)]
         plays: u32,
+        /// Dark border in pixels around the text that cuts out the layers
+        /// beneath it (0 = none).
+        #[serde(default)]
+        outline: u32,
+        /// White lights LEDs; black cuts the text out of the layers beneath.
+        #[serde(default)]
+        color: OverlayColor,
+        /// Flip the text before its color applies: white lights the panel
+        /// around dark text, black cuts out all but the text.
+        #[serde(default)]
+        invert: bool,
     },
     Gif {
         path: PathBuf,
@@ -586,10 +784,11 @@ pub enum ElementKind {
         /// Fixed playback rate; 0 keeps the GIF's own frame timing.
         #[serde(default)]
         fps: f32,
-        /// Whether element cycling waits for `plays` complete animations.
-        #[serde(default)]
+        /// Older configurations: whether element cycling waited for `plays`
+        /// complete animations; only read to give the element its turn.
+        #[serde(default, skip_serializing)]
         limit_plays: bool,
-        #[serde(default = "default_plays")]
+        #[serde(default = "default_plays", skip_serializing)]
         plays: u32,
         /// What happens at the last frame.
         #[serde(default, rename = "loop")]
@@ -617,8 +816,11 @@ pub enum ElementKind {
         scroll_pause: f32,
         #[serde(default)]
         ignore_safe_area: bool,
+        /// Pixels to move the GIF down / right (negative: up / left).
         #[serde(default)]
         y_offset: i32,
+        #[serde(default)]
+        x_offset: i32,
         /// Optional text drawn over the GIF, centred.
         #[serde(default)]
         overlay_text: String,
@@ -635,6 +837,40 @@ pub enum ElementKind {
         /// Border in the opposite color, in pixels (0 = none).
         #[serde(default)]
         overlay_outline: u32,
+        /// Pixels to move the overlay right / down from the GIF's middle
+        /// (negative: left / up).
+        #[serde(default)]
+        overlay_x_offset: i32,
+        #[serde(default)]
+        overlay_y_offset: i32,
+        /// Degrees to turn the overlay text clockwise about its middle.
+        #[serde(default)]
+        overlay_rotation: f32,
+        /// Overlay animation, as a text element's; it advances with the GIF
+        /// (see `GifAnimation::overlay_fps`).
+        #[serde(default)]
+        overlay_mode: TextMode,
+        #[serde(default)]
+        overlay_direction: ScrollDirection,
+        #[serde(default = "default_overlay_speed")]
+        overlay_speed: f32,
+        #[serde(default = "default_text_period")]
+        overlay_period: f32,
+        #[serde(default)]
+        overlay_scroll_pause: f32,
+        /// Light the dark pixels and darken the lit ones (before the overlay).
+        #[serde(default)]
+        invert: bool,
+        /// Invert only where the GIF is, leaving the rest of the panel dark.
+        #[serde(default)]
+        invert_gif_only: bool,
+        /// Blend pixels when scaling or turning the GIF; off picks the
+        /// nearest pixel, keeping pixel art crisp.
+        #[serde(default = "default_true")]
+        smooth_scaling: bool,
+        /// Multiplies the size the layout picks (not the Animate size).
+        #[serde(default = "default_gif_scale")]
+        scale: f32,
     },
     /// Every LED on at `brightness`.
     Flashlight {
@@ -652,15 +888,21 @@ pub enum ElementKind {
         /// Pixels to move the element down (negative: up).
         #[serde(default)]
         y_offset: i32,
+        /// Pixels to move the element right (negative: left).
+        #[serde(default)]
+        x_offset: i32,
         /// Lay out on the whole canvas instead of the guaranteed-visible area.
         #[serde(default)]
         ignore_safe_area: bool,
+        /// Size of the whole gauge, labels included, about its middle.
+        #[serde(default = "default_battery_scale")]
+        scale: f32,
     },
 }
 
 impl ElementKind {
-    /// The play count, for animated elements that have one enabled.
-    pub fn play_limit(&self) -> Option<u32> {
+    /// The play count older configurations set, for converting them.
+    fn play_limit(&self) -> Option<u32> {
         match self {
             Self::Text { limit_plays: true, plays, .. } | Self::Gif { limit_plays: true, plays, .. } => {
                 Some((*plays).max(1))
@@ -673,7 +915,7 @@ impl ElementKind {
         match self {
             Self::Clock { .. } => "Clock",
             Self::Text { .. } => "Text",
-            Self::Gif { .. } => "GIF",
+            Self::Gif { .. } => "GIF/Image",
             Self::Flashlight { .. } => "Flashlight",
             Self::Battery { .. } => "Battery",
         }
@@ -686,6 +928,9 @@ pub enum TextMode {
     Static,
     #[default]
     Scroll,
+    /// Like scroll, but the next copy follows straight behind instead of
+    /// waiting for the panel to empty.
+    InfiniteScroll,
     /// Back and forth along the scroll direction's axis.
     Bounce,
     Blink,
@@ -698,14 +943,15 @@ pub enum TextMode {
 }
 
 impl TextMode {
-    pub const ALL: [Self; 7] = [
-        Self::Static, Self::Scroll, Self::Bounce, Self::Blink, Self::Pulse, Self::Typewriter, Self::Wave,
+    pub const ALL: [Self; 8] = [
+        Self::Static, Self::Scroll, Self::InfiniteScroll, Self::Bounce, Self::Blink, Self::Pulse, Self::Typewriter, Self::Wave,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Static => "Static",
             Self::Scroll => "Scroll",
+            Self::InfiniteScroll => "Infinite scroll",
             Self::Bounce => "Bounce",
             Self::Blink => "Blink",
             Self::Pulse => "Pulse",
@@ -827,6 +1073,19 @@ fn default_font() -> PathBuf {
 pub const MAX_SCROLL_PAUSE: f32 = 3600.0;
 pub const MAX_SPRITE_SIZE: u32 = 64;
 pub const MAX_GIF_BRIGHTNESS: f32 = 2.0;
+pub const MIN_BATTERY_SCALE: f32 = 0.25;
+pub const MAX_BATTERY_SCALE: f32 = 4.0;
+
+const fn default_battery_scale() -> f32 {
+    1.0
+}
+
+pub const MIN_GIF_SCALE: f32 = 0.1;
+pub const MAX_GIF_SCALE: f32 = 10.0;
+
+const fn default_gif_scale() -> f32 {
+    1.0
+}
 pub const MIN_CONTRAST: f32 = 0.2;
 pub const MAX_CONTRAST: f32 = 4.0;
 pub const MAX_BLACK_LEVEL: f32 = 90.0;
@@ -840,7 +1099,8 @@ const fn default_overlay_size() -> f32 {
     12.0
 }
 
-/// Color of a GIF's text overlay: lit LEDs, or LEDs cut out of the GIF.
+/// Color of text elements and GIF overlays: lit LEDs, or LEDs cut out of
+/// what lies beneath.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OverlayColor {
@@ -965,6 +1225,10 @@ const fn default_text_period() -> f32 {
 /// Upper bound for every FPS setting; one D-Bus frame takes ~30 ms.
 pub const MAX_FPS: f32 = 30.0;
 
+const fn default_millis_digits() -> u8 {
+    3
+}
+
 const fn default_clock_fps() -> f32 {
     10.0
 }
@@ -979,6 +1243,36 @@ const fn default_cycle_seconds() -> u32 {
 
 const fn default_true() -> bool {
     true
+}
+
+const fn default_overlay_speed() -> f32 {
+    18.0
+}
+
+const fn default_preview_row_height() -> f32 {
+    0.65
+}
+
+const fn default_preview_height() -> i32 {
+    160
+}
+
+const fn default_tilt_per_row() -> f32 {
+    0.5
+}
+
+/// An element's rotation in degrees, or the older on/off `flipped` switch.
+fn rotation_degrees<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<f32, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Stored {
+        Degrees(f32),
+        Flipped(bool),
+    }
+    Ok(match Stored::deserialize(deserializer)? {
+        Stored::Degrees(degrees) => degrees,
+        Stored::Flipped(flipped) => if flipped { 180.0 } else { 0.0 },
+    })
 }
 
 fn default_brightness() -> String {
@@ -1004,11 +1298,46 @@ fn default_shutdown() -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn duplicated_profiles_are_independent_copies() {
+        let mut profile = DisplayProfile::new("Night", vec![Element::clock(), Element::text()]);
+        profile.cycle.enabled = true;
+        let copy = profile.duplicate();
+        assert_eq!(copy.name, "Night (copy)");
+        assert_ne!(copy.id, profile.id);
+        assert_eq!(copy.cycle, profile.cycle);
+        assert_eq!(copy.elements.len(), 2);
+        let element = profile.elements[0].duplicate();
+        assert_ne!(element.id, profile.elements[0].id);
+        assert_eq!(element.kind, profile.elements[0].kind);
+        for (original, copied) in profile.elements.iter().zip(&copy.elements) {
+            assert_ne!(original.id, copied.id);
+            assert_eq!(original.kind, copied.kind);
+        }
+    }
+
+    #[test]
+    fn older_profile_cycle_settings_become_element_turns() {
+        let stored = r#"{"profiles": [{"id": "p", "name": "Old", "cycle": {"enabled": true, "seconds": 12, "after_animations": true},
+            "elements": [
+                {"id": "a", "type": "clock", "font": "f.ttf", "font_size": 15.0, "use_24_hour": true, "show_seconds": false,
+                 "show_date": false, "date_format": "%Y", "show_millis": false},
+                {"id": "b", "type": "text", "text": "Hi", "font": "f.ttf", "font_size": 14.0, "mode": "scroll", "speed": 18.0,
+                 "limit_plays": true, "plays": 3}
+            ]}], "active_profile": "p"}"#;
+        let config: AppConfig = serde_json::from_str(stored).unwrap();
+        let turns: Vec<_> = config.profiles[0].elements.iter().map(|element| element.turn).collect();
+        assert_eq!(turns, [Some(TurnLength::Seconds(12)), Some(TurnLength::Cycles(3))]);
+        // The old settings are not written back.
+        let saved = serde_json::to_string(&config).unwrap();
+        assert!(!saved.contains("after_animations") && !saved.contains("limit_plays"));
+    }
+
+    #[test]
     fn triggers_load_from_plain_profile_ids() {
         let triggers: ProfileTriggers = serde_json::from_str(r#"{"plugged_in": "ac", "unplugged": null}"#).unwrap();
         assert_eq!(triggers.plugged_in, Trigger::to("ac"));
         assert_eq!(triggers.unplugged, Trigger::default());
-        assert_eq!(triggers.lid_closed_plugged_in, Trigger::default());
+        assert_eq!(triggers.closed_plugged_in, Trigger::default());
         let full = r#"{"lid_closed": {"profile": "dark", "revert_after_secs": 30}}"#;
         let triggers: ProfileTriggers = serde_json::from_str(full).unwrap();
         assert_eq!(triggers.lid_closed, Trigger { profile: Some("dark".into()), revert_after_secs: Some(30) });

@@ -60,7 +60,13 @@ pub fn level_buffer(levels: &[u8], brightness: f32, geometry: MatrixGeometry) ->
     })
 }
 
-fn map_leds(geometry: MatrixGeometry, pixel: impl Fn(usize, usize) -> u8) -> Vec<u8> {
+/// Where each LED in the buffer sits on the canvas, in buffer order; `None`
+/// for the unused tail of the buffer. For drawing a picture of the panel.
+pub fn led_positions(geometry: MatrixGeometry) -> Vec<Option<(u16, u16)>> {
+    map_leds(geometry, |x, y| Some((x as u16, y as u16)))
+}
+
+fn map_leds<T: Copy + Default>(geometry: MatrixGeometry, pixel: impl Fn(usize, usize) -> T) -> Vec<T> {
     let pixel = &pixel;
     let height = geometry.height as usize;
     // A diagonal run of `len` LEDs starting at (x, y), counted from the bottom.
@@ -68,7 +74,7 @@ fn map_leds(geometry: MatrixGeometry, pixel: impl Fn(usize, usize) -> u8) -> Vec
 
     match geometry.model {
         MatrixModel::Ga401 => {
-            let mut buf = vec![0; PANE_LEN * 2];
+            let mut buf = vec![T::default(); PANE_LEN * 2];
             for (start, x, y, len) in GA401_ROWS {
                 for (slot, value) in buf[start..start + len].iter_mut().zip(row(x, y, len)) {
                     *slot = value;
@@ -100,16 +106,17 @@ fn map_leds(geometry: MatrixGeometry, pixel: impl Fn(usize, usize) -> u8) -> Vec
     }
 }
 
-fn sequential<R, I>(runs: impl Iterator<Item = (usize, usize, usize)>, len: usize, row: R) -> Vec<u8>
+fn sequential<T, R, I>(runs: impl Iterator<Item = (usize, usize, usize)>, len: usize, row: R) -> Vec<T>
 where
+    T: Copy + Default,
     R: Fn(usize, usize, usize) -> I,
-    I: Iterator<Item = u8>,
+    I: Iterator<Item = T>,
 {
     let mut buf = Vec::with_capacity(len);
     for (x, y, count) in runs {
         buf.extend(row(x, y, count));
     }
-    buf.resize(len, 0);
+    buf.resize(len, T::default());
     buf
 }
 
@@ -118,6 +125,20 @@ mod tests {
     use image::Rgb;
 
     use super::*;
+
+    #[test]
+    fn every_led_has_its_own_place_on_the_canvas() {
+        for board in ["GA401IV", "GA402RK", "GU604VY", "G635LX"] {
+            let geometry = MatrixGeometry::for_board_name(board);
+            let positions = led_positions(geometry);
+            let frame = RgbImage::new(geometry.width, geometry.height);
+            assert_eq!(positions.len(), led_buffer(&frame, 1.0, geometry).len(), "{board}");
+            let placed: Vec<_> = positions.iter().flatten().collect();
+            let unique: std::collections::HashSet<_> = placed.iter().collect();
+            assert_eq!(unique.len(), placed.len(), "{board}: two LEDs share a pixel");
+            assert!(placed.len() > 700, "{board}");
+        }
+    }
 
     #[test]
     fn buffers_match_asusd_lengths() {
