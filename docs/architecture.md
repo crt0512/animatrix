@@ -47,7 +47,7 @@ Each visible element reports when it can next look different: a clock at the nex
 Other reasons to wake up:
 
 - **Settings changes** from the window or tray wake the engine immediately.
-- **Sensors** are read only if a setting needs them: the lid for the [lid close delay](device.md#lid-close-delay) or lid triggers, mains power for *Unless plugged in* or power triggers. Then they are checked once a second.
+- **Sensors** are read only if a setting needs them: the lid for the [lid close delay](device.md#lid-close-delay) or lid triggers, mains power for *Unless plugged in* or power triggers; both for the *lid and plugged in* triggers. Then they are checked once a second, which also runs pending [switch-backs](profiles.md#switching-back).
 - **Element cycling** checks for the next turn every 200 ms.
 - A frame that could not be sent (for example while `asusd` restarts) is retried after a second.
 

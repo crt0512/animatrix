@@ -1,6 +1,8 @@
 #[cfg(feature = "tray")]
 mod tray;
 #[cfg(feature = "gui")]
+mod remote;
+#[cfg(feature = "gui")]
 mod ui;
 
 #[cfg(feature = "gui")]
@@ -12,6 +14,9 @@ fn main() -> anyhow::Result<()> {
     // GTK rejects options it does not know, so take ours out first.
     let (minimized, args): (Vec<String>, Vec<String>) =
         std::env::args().partition(|arg| arg == "--minimized");
+    if let Some(command) = remote::parse(args.get(1..).unwrap_or_default())? {
+        return remote::run(command);
+    }
 
     let store = ConfigStore::discover()?;
     let config = store.load()?;

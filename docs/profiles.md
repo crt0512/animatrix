@@ -4,6 +4,8 @@ A **profile** is a named group of [elements](elements.md). Exactly one profile i
 
 Add a profile with **Add profile**, then add elements to it with the **+ Clock / + Text / + GIF / + Flashlight / + Battery** buttons on its card. A profile without elements leaves the panel dark.
 
+The arrow at the left of a card collapses it to its heading row. When the window opens, only the active profile is expanded; profiles you open or close stay that way until Animatrix quits.
+
 ## Layering
 
 By default every element of a profile is drawn at the same time. Each element is rendered on its own canvas and the layers are combined LED by LED, keeping the brightest value, so the order does not change how layers look. A dim [flashlight](elements.md#flashlight) under text makes a lit background with brighter text on top.
@@ -35,14 +37,26 @@ One cycle is:
 
 ## Switching automatically
 
-**Switch profile automatically**, at the top of the Profiles page, picks a profile to activate when something changes:
+**Switch profile automatically**, on the Device behavior tab, picks a profile to activate when something changes:
 
 - when plugged in
 - when unplugged
 - when the lid closes
 - when the lid opens
+- when the lid is closed and plugged in
+- when the lid is open and plugged in
 
-Each defaults to *Do nothing*. Only changes count: the state at startup never switches profiles. If the lid and the power change at the same moment, the lid wins. Deleting a profile clears any trigger pointing at it.
+Each defaults to *Do nothing*. Only changes count: the state at startup never switches profiles. Deleting a profile clears any trigger pointing at it.
+
+The two *and plugged in* triggers fire on entering that state by either route: closing the lid while plugged in, or plugging in with the lid closed (likewise for open). When one of them fires, it takes priority over the plain lid and power triggers. Left at *Do nothing*, the plain triggers apply as before. If the lid and the power change at the same moment, the lid wins over power.
+
+### Switching back
+
+Each trigger has **Switch back after (seconds)**. With a value above 0, Animatrix returns to the profile that was active before the trigger once that time has passed. 0 stays on the new profile.
+
+- Picking a profile yourself (in the window or the tray) before then cancels the switch back.
+- If another trigger fires first, it takes over; if it also switches back, it returns to the profile from before the first trigger.
+- If the profile to return to was deleted, nothing happens.
 
 This combines with the [lid close delay](device.md#lid-close-delay): a profile picked for "when the lid closes" is what shows while the panel keeps running with the lid shut.
 

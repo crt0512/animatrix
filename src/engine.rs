@@ -11,7 +11,7 @@ use crate::animation::GifAnimation;
 use crate::asusctl::{Asusctl, MatrixControl};
 use crate::model::{
     AppConfig, CycleSettings, DevicePolicy, DisplayProfile, Element, ElementKind, GifLayout, MatrixGeometry,
-    ProfileTriggers, TextMode,
+    ProfileTriggers, TextMode, Trigger,
 };
 use crate::render::{self, MatrixRenderer};
 use crate::{matrix, sensors};
@@ -115,6 +115,8 @@ fn run_engine<C: MatrixControl>(
     // which of the two were being watched when it was taken.
     let mut last_lid: Option<LidState> = None;
     let mut last_watch = (false, false);
+    // A trigger's pending switch back to the profile before it.
+    let mut revert: Option<Revert> = None;
 
     if let Ok(config) = config.lock() {
         record(&status, control.apply_policy(&config.policy));
@@ -156,12 +158,7 @@ fn run_engine<C: MatrixControl>(
                     closed: watch.0 && sensors::lid_closed() == Some(true),
                     on_mains: watch.1 && sensors::on_mains() == Some(true),
                 };
-                if let Some(id) = last_lid.and_then(|before| triggered_profile(&config.triggers, before, lid)) {
-                    if config.profiles.iter().any(|profile| &profile.id == id) {
-                        config.active_profile = Some(id.clone());
-                        changed = true;
-                    }
-                }
+                changed |= apply_triggers(&mut config, last_lid, lid, &mut revert, Instant::now());
                 last_lid = Some(lid);
                 (config.clone(), lid)
             }
@@ -191,7 +188,7 @@ fn run_engine<C: MatrixControl>(
             tick = if blanked {
                 Some(IDLE_TICK)
             } else {
-                (last_watch != (false, false)).then_some(TRIGGER_POLL)
+                (last_watch != (false, false) || revert.is_some()).then_some(TRIGGER_POLL)
             };
             continue;
         }
@@ -264,7 +261,7 @@ fn run_engine<C: MatrixControl>(
         if profile.cycle.enabled && profile.elements.len() > 1 {
             earliest(&mut wake, IDLE_TICK);
         }
-        if last_watch != (false, false) {
+        if last_watch != (false, false) || revert.is_some() {
             earliest(&mut wake, TRIGGER_POLL);
         }
         tick = wake;
@@ -347,10 +344,13 @@ fn sensors_needed(config: &AppConfig) -> (bool, bool) {
     let policy = &config.policy;
     let triggers = &config.triggers;
     let engine_lid = config.enabled && policy.engine_handles_lid();
-    let lid = engine_lid || triggers.lid_closed.is_some() || triggers.lid_opened.is_some();
+    let set = |trigger: &Trigger| trigger.profile.is_some();
+    let combined = set(&triggers.lid_closed_plugged_in) || set(&triggers.lid_opened_plugged_in);
+    let lid = engine_lid || combined || set(&triggers.lid_closed) || set(&triggers.lid_opened);
     let power = engine_lid && policy.lid_stay_on_when_plugged
-        || triggers.plugged_in.is_some()
-        || triggers.unplugged.is_some();
+        || combined
+        || set(&triggers.plugged_in)
+        || set(&triggers.unplugged);
     (lid, power)
 }
 
@@ -360,20 +360,78 @@ fn notify(listeners: &Listeners) {
     }
 }
 
-/// The profile a change from `before` to `now` switches to. When power and
-/// lid change in the same tick, the lid wins.
-fn triggered_profile(triggers: &ProfileTriggers, before: LidState, now: LidState) -> Option<&String> {
+/// The trigger a change from `before` to `now` fires, skipping ones set to
+/// "do nothing". The lid-and-power triggers are the most specific, so they
+/// win, then the lid, then power.
+fn fired_trigger(triggers: &ProfileTriggers, before: LidState, now: LidState) -> Option<&Trigger> {
+    let entered = |closed: bool| now.closed == closed && now.on_mains && !(before.closed == closed && before.on_mains);
+    let combined = if entered(true) {
+        Some(&triggers.lid_closed_plugged_in)
+    } else if entered(false) {
+        Some(&triggers.lid_opened_plugged_in)
+    } else {
+        None
+    };
     let lid = match (before.closed, now.closed) {
-        (false, true) => triggers.lid_closed.as_ref(),
-        (true, false) => triggers.lid_opened.as_ref(),
+        (false, true) => Some(&triggers.lid_closed),
+        (true, false) => Some(&triggers.lid_opened),
         _ => None,
     };
     let power = match (before.on_mains, now.on_mains) {
-        (false, true) => triggers.plugged_in.as_ref(),
-        (true, false) => triggers.unplugged.as_ref(),
+        (false, true) => Some(&triggers.plugged_in),
+        (true, false) => Some(&triggers.unplugged),
         _ => None,
     };
-    lid.or(power)
+    [combined, lid, power].into_iter().flatten().find(|trigger| trigger.profile.is_some())
+}
+
+/// Switch back to `to` at `at`, unless the active profile is no longer
+/// `from` by then (picked by hand or by another trigger).
+#[derive(Clone, Debug, PartialEq)]
+struct Revert {
+    to: Option<String>,
+    from: String,
+    at: Instant,
+}
+
+/// Runs due switch-backs and fired triggers; true if the active profile
+/// changed. `before` is `None` on the first reading, which fires nothing.
+fn apply_triggers(
+    config: &mut AppConfig,
+    before: Option<LidState>,
+    now: LidState,
+    revert: &mut Option<Revert>,
+    at: Instant,
+) -> bool {
+    let exists = |config: &AppConfig, id: &str| config.profiles.iter().any(|profile| profile.id == id);
+    let mut changed = false;
+    if let Some(pending) = revert.as_ref() {
+        if config.active_profile.as_deref() != Some(pending.from.as_str()) {
+            *revert = None;
+        } else if at >= pending.at {
+            if let Some(to) = pending.to.as_deref().filter(|to| exists(config, to)) {
+                config.active_profile = Some(to.to_owned());
+                changed = true;
+            }
+            *revert = None;
+        }
+    }
+    let Some(trigger) = before.and_then(|before| fired_trigger(&config.triggers, before, now)) else {
+        return changed;
+    };
+    let Some(id) = trigger.profile.clone().filter(|id| exists(config, id)) else {
+        return changed;
+    };
+    let after = trigger.revert_after_secs.filter(|&secs| secs > 0);
+    // Temporary switches in a row all lead back to where the first started.
+    let home = match revert.take() {
+        Some(pending) => pending.to,
+        None => config.active_profile.clone(),
+    };
+    *revert = after.map(|secs| Revert { to: home, from: id.clone(), at: at + Duration::from_secs(secs.into()) });
+    changed |= config.active_profile.as_ref() != Some(&id);
+    config.active_profile = Some(id);
+    changed
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -605,24 +663,75 @@ mod tests {
         assert_eq!(frame_interval(&Element::text().kind, now), Some(Duration::from_millis(200)));
     }
 
+    fn fired<'a>(triggers: &'a ProfileTriggers, before: LidState, now: LidState) -> Option<&'a str> {
+        fired_trigger(triggers, before, now).and_then(|trigger| trigger.profile.as_deref())
+    }
+
     #[test]
     fn triggers_fire_on_changes_only() {
         let triggers = ProfileTriggers {
-            plugged_in: Some("ac".into()),
-            unplugged: Some("battery".into()),
-            lid_closed: Some("closed".into()),
-            lid_opened: None,
+            plugged_in: Trigger::to("ac"),
+            unplugged: Trigger::to("battery"),
+            lid_closed: Trigger::to("closed"),
+            ..ProfileTriggers::default()
         };
         let state = |closed, on_mains| LidState { closed, on_mains };
-        let fired = |before, now| triggered_profile(&triggers, before, now).map(String::as_str);
-        assert_eq!(fired(state(false, false), state(false, false)), None);
-        assert_eq!(fired(state(false, false), state(false, true)), Some("ac"));
-        assert_eq!(fired(state(false, true), state(false, false)), Some("battery"));
-        assert_eq!(fired(state(false, true), state(true, true)), Some("closed"));
+        assert_eq!(fired(&triggers, state(false, false), state(false, false)), None);
+        assert_eq!(fired(&triggers, state(false, false), state(false, true)), Some("ac"));
+        assert_eq!(fired(&triggers, state(false, true), state(false, false)), Some("battery"));
+        assert_eq!(fired(&triggers, state(false, true), state(true, true)), Some("closed"));
         // "Do nothing" for opening the lid.
-        assert_eq!(fired(state(true, true), state(false, true)), None);
+        assert_eq!(fired(&triggers, state(true, true), state(false, true)), None);
         // Lid and power at once: the lid wins.
-        assert_eq!(fired(state(false, true), state(true, false)), Some("closed"));
+        assert_eq!(fired(&triggers, state(false, true), state(true, false)), Some("closed"));
+    }
+
+    #[test]
+    fn lid_and_power_triggers_win_when_set() {
+        let mut triggers = ProfileTriggers {
+            plugged_in: Trigger::to("ac"),
+            lid_closed: Trigger::to("closed"),
+            lid_closed_plugged_in: Trigger::to("docked"),
+            lid_opened_plugged_in: Trigger::to("desk"),
+            ..ProfileTriggers::default()
+        };
+        let state = |closed, on_mains| LidState { closed, on_mains };
+        // Entered by closing the lid while plugged in, or plugging in with it closed.
+        assert_eq!(fired(&triggers, state(false, true), state(true, true)), Some("docked"));
+        assert_eq!(fired(&triggers, state(true, false), state(true, true)), Some("docked"));
+        assert_eq!(fired(&triggers, state(true, true), state(false, true)), Some("desk"));
+        assert_eq!(fired(&triggers, state(false, false), state(false, true)), Some("desk"));
+        // Closing on battery is the plain lid trigger.
+        assert_eq!(fired(&triggers, state(false, false), state(true, false)), Some("closed"));
+        // Left at "do nothing", the plain triggers still apply.
+        triggers.lid_opened_plugged_in = Trigger::default();
+        assert_eq!(fired(&triggers, state(false, false), state(false, true)), Some("ac"));
+    }
+
+    #[test]
+    fn triggers_switch_back_after_their_timeout() {
+        let mut config = AppConfig::default();
+        let home = config.profiles[0].id.clone();
+        let away = DisplayProfile::new("Away", Vec::new());
+        let (away_id, start) = (away.id.clone(), Instant::now());
+        config.profiles.push(away);
+        config.triggers.unplugged = Trigger { profile: Some(away_id.clone()), revert_after_secs: Some(60) };
+        let (plugged, unplugged) = (LidState { closed: false, on_mains: true }, LidState { closed: false, on_mains: false });
+        let later = |seconds| start + Duration::from_secs(seconds);
+        let mut revert = None;
+
+        assert!(apply_triggers(&mut config, Some(plugged), unplugged, &mut revert, later(0)));
+        assert_eq!(config.active_profile.as_ref(), Some(&away_id));
+        assert!(!apply_triggers(&mut config, Some(unplugged), unplugged, &mut revert, later(59)));
+        assert!(apply_triggers(&mut config, Some(unplugged), unplugged, &mut revert, later(60)));
+        assert_eq!(config.active_profile.as_ref(), Some(&home));
+        assert_eq!(revert, None);
+
+        // Picking a profile by hand cancels the switch back.
+        apply_triggers(&mut config, Some(plugged), unplugged, &mut revert, later(100));
+        config.active_profile = Some(home.clone());
+        apply_triggers(&mut config, Some(unplugged), unplugged, &mut revert, later(101));
+        assert_eq!(revert, None);
     }
 
     #[test]
@@ -630,11 +739,10 @@ mod tests {
         let config = AppConfig::default();
         let before = LidState { closed: false, on_mains: true };
         let after = LidState { closed: false, on_mains: false };
-        let mut triggers = ProfileTriggers::default();
-        triggers.unplugged = Some(config.profiles[0].id.clone());
-        assert_eq!(triggered_profile(&triggers, before, after), Some(&config.profiles[0].id));
+        let mut triggers = ProfileTriggers { unplugged: Trigger::to(&config.profiles[0].id), ..ProfileTriggers::default() };
+        assert_eq!(fired(&triggers, before, after), Some(config.profiles[0].id.as_str()));
         triggers.forget(&config.profiles[0].id);
-        assert_eq!(triggered_profile(&triggers, before, after), None);
+        assert_eq!(fired(&triggers, before, after), None);
     }
 
     #[test]

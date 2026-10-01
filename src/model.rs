@@ -114,27 +114,90 @@ pub struct WindowState {
     pub maximized: bool,
 }
 
-/// Profiles to switch to when the power or lid state changes; `None` does
-/// nothing. Entries pointing at deleted profiles are ignored.
+/// Profiles to switch to when the power or lid state changes. Entries
+/// pointing at deleted profiles are ignored.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProfileTriggers {
     #[serde(default)]
-    pub plugged_in: Option<String>,
+    pub plugged_in: Trigger,
     #[serde(default)]
-    pub unplugged: Option<String>,
+    pub unplugged: Trigger,
     #[serde(default)]
-    pub lid_closed: Option<String>,
+    pub lid_closed: Trigger,
     #[serde(default)]
-    pub lid_opened: Option<String>,
+    pub lid_opened: Trigger,
+    /// Entering "lid closed while on mains power", by either change.
+    #[serde(default)]
+    pub lid_closed_plugged_in: Trigger,
+    /// Entering "lid open while on mains power", by either change.
+    #[serde(default)]
+    pub lid_opened_plugged_in: Trigger,
 }
 
 impl ProfileTriggers {
+    pub fn all(&self) -> [&Trigger; 6] {
+        [
+            &self.plugged_in,
+            &self.unplugged,
+            &self.lid_closed,
+            &self.lid_opened,
+            &self.lid_closed_plugged_in,
+            &self.lid_opened_plugged_in,
+        ]
+    }
+
     /// Forgets a deleted profile.
     pub fn forget(&mut self, id: &str) {
-        for trigger in [&mut self.plugged_in, &mut self.unplugged, &mut self.lid_closed, &mut self.lid_opened] {
-            if trigger.as_deref() == Some(id) {
-                *trigger = None;
+        for trigger in [
+            &mut self.plugged_in,
+            &mut self.unplugged,
+            &mut self.lid_closed,
+            &mut self.lid_opened,
+            &mut self.lid_closed_plugged_in,
+            &mut self.lid_opened_plugged_in,
+        ] {
+            if trigger.profile.as_deref() == Some(id) {
+                trigger.profile = None;
             }
+        }
+    }
+}
+
+/// One automatic switch: the profile to show (`None` does nothing) and,
+/// optionally, how long before switching back to the profile that was
+/// active before.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "TriggerConfig")]
+pub struct Trigger {
+    pub profile: Option<String>,
+    /// Seconds; `None` stays on the profile.
+    #[serde(default)]
+    pub revert_after_secs: Option<u32>,
+}
+
+impl Trigger {
+    pub fn to(profile: &str) -> Self {
+        Self { profile: Some(profile.to_owned()), revert_after_secs: None }
+    }
+}
+
+/// Triggers were plain profile ids (or null) before they had a timeout.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TriggerConfig {
+    Profile(Option<String>),
+    Full {
+        profile: Option<String>,
+        #[serde(default)]
+        revert_after_secs: Option<u32>,
+    },
+}
+
+impl From<TriggerConfig> for Trigger {
+    fn from(config: TriggerConfig) -> Self {
+        match config {
+            TriggerConfig::Profile(profile) => Self { profile, revert_after_secs: None },
+            TriggerConfig::Full { profile, revert_after_secs } => Self { profile, revert_after_secs },
         }
     }
 }
@@ -940,6 +1003,17 @@ fn default_shutdown() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn triggers_load_from_plain_profile_ids() {
+        let triggers: ProfileTriggers = serde_json::from_str(r#"{"plugged_in": "ac", "unplugged": null}"#).unwrap();
+        assert_eq!(triggers.plugged_in, Trigger::to("ac"));
+        assert_eq!(triggers.unplugged, Trigger::default());
+        assert_eq!(triggers.lid_closed_plugged_in, Trigger::default());
+        let full = r#"{"lid_closed": {"profile": "dark", "revert_after_secs": 30}}"#;
+        let triggers: ProfileTriggers = serde_json::from_str(full).unwrap();
+        assert_eq!(triggers.lid_closed, Trigger { profile: Some("dark".into()), revert_after_secs: Some(30) });
+    }
+
     use super::*;
 
     #[test]

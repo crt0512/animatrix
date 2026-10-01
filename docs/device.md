@@ -1,25 +1,39 @@
 # Device behaviour and tray
 
-The **Device behavior** page controls the panel itself through `asusctl`. Press **Apply device behavior** to send the settings; they are also applied every time Animatrix starts.
+Animatrix controls the panel itself through `asusctl`. Device settings are applied every time Animatrix starts.
 
-## Settings
+## Brightness
+
+**Brightness** at the left of the window header is the global cap on the panel: off, low, med or high. It applies on top of each element's own brightness, to every profile, as soon as you change it.
+
+## Device behavior tab
+
+The **Device behavior** tab holds [Switch profile automatically](profiles.md#switching-automatically) and the **Turn off** options. Turn off options apply as soon as they change.
 
 | Setting                                   | Effect                                                                                       |
 |-------------------------------------------|----------------------------------------------------------------------------------------------|
-| Turn off when unplugged                   | Panel off while running on battery                                                           |
-| Turn off while suspended                  | Panel off during suspend                                                                     |
-| Turn off when the lid is closed           | Panel off when the lid closes (see the options below)                                        |
+| When unplugged                            | Panel off while running on battery                                                           |
+| While suspended                           | Panel off during suspend                                                                     |
+| When the lid is closed                    | Panel off when the lid closes (see the options below)                                        |
 | ↳ Unless plugged in                       | Keep running with the lid closed while on mains power; see [Lid close delay](#lid-close-delay) |
-| ↳ Keep animating after lid closes         | Seconds to keep going after the lid closes (on battery with *Unless plugged in*)             |
+| ↳ Keep animating after the lid closes     | Seconds to keep going after the lid closes (on battery with *Unless plugged in*)             |
+
+## Settings tab
+
+| Setting                                   | Effect                                                                                       |
+|-------------------------------------------|----------------------------------------------------------------------------------------------|
+| Invert tray icon colors                   | White tray icons for dark panels; applies immediately                                        |
+| Swap tray clicks                          | See [Tray](#tray); applies immediately                                                        |
 | Enable built-in powersave animation       | ASUS's own animations when idle                                                              |
-| Brightness                                | Global panel brightness: off, low, med, high; applies on top of each element's brightness    |
 | Boot / awake / sleep / shutdown animation | ASUS built-in animation for each state, by name as `asusctl anime set-builtins` expects them |
+
+Press **Apply built-in animations** to send the powersave and animation settings.
 
 Animatrix only sends built in animation and powersave commands when they differ from what `asusd` reports, which avoids needless USB traffic.
 
 ## Lid close delay
 
-With *Turn off when the lid is closed* ticked, its two options (only usable while it is ticked) decide when:
+With *Turn off → When the lid is closed* ticked, its two options (only usable while it is ticked) decide when:
 
 | Unless plugged in | Delay | Lid closed on mains power | Lid closed on battery |
 | --- | --- | --- | --- |
@@ -43,6 +57,6 @@ The **Light show** switch in the window header (and the tray) turns Animatrix's 
 - **Left-click** the tray icon to turn the light show on or off. The icon shows the current state.
 - **Right-click** for the menu: light show on/off, switch profile, open the window, quit.
 - **Middle-click** also turns the light show on or off.
-- Tick **Swap tray clicks** on the Device behavior page to open the menu with a left click instead; middle-click then turns the light show on or off. Right-click still opens the menu, since the panel handles right clicks itself.
-- The icons are black. On a dark panel tick **Invert tray icon colors** at the top of the Device behavior page to draw them white; this applies immediately.
+- Tick **Swap tray clicks** on the Settings tab to open the menu with a left click instead; middle-click then turns the light show on or off. Right-click still opens the menu, since the panel handles right clicks itself.
+- The icons are black. On a dark panel tick **Invert tray icon colors** on the Settings tab to draw them white; this applies immediately.
 - Closing the window keeps Animatrix running in the tray. Use *Quit* in the tray menu to exit.
