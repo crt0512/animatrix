@@ -31,12 +31,48 @@ struct UiContext {
 
 use crate::remote::APP_ID;
 
-/// With `minimized`, the first activation opens no window; the tray or a
-/// second launch opens it later.
-pub fn run(config: Arc<Mutex<AppConfig>>, store: ConfigStore, engine: EngineHandle, args: &[String], minimized: bool) {
+/// Registers the application on the session bus. Returns `None` when another
+/// animatrix already runs: a normal launch then asks it to show its window and
+/// a `--minimized` one does nothing, so the duplicate exits before starting a
+/// second engine and tray.
+pub fn claim(args: &[String], minimized: bool) -> Option<gtk::Application> {
     let app = gtk::Application::builder()
         .application_id(APP_ID)
         .build();
+    app.connect_startup(|_| {
+        // Installed builds find the icon in hicolor; source builds use data/.
+        #[cfg(debug_assertions)]
+        if let Some(display) = gtk::gdk::Display::default() {
+            gtk::IconTheme::for_display(&display).add_search_path(concat!(env!("CARGO_MANIFEST_DIR"), "/data"));
+        }
+        gtk::Window::set_default_icon_name(APP_ID);
+    });
+    if let Err(error) = app.register(gtk::gio::Cancellable::NONE) {
+        eprintln!("animatrix: could not register on the session bus: {error}");
+    }
+    if app.is_remote() {
+        if minimized {
+            // Never run, so finalizing it would warn about not unregistering;
+            // the process exits right after anyway.
+            std::mem::forget(app);
+        } else {
+            app.run_with_args(args);
+        }
+        return None;
+    }
+    Some(app)
+}
+
+/// Runs the application `claim` returned. With `minimized`, the first
+/// activation opens no window; the tray or a second launch opens it later.
+pub fn run(
+    app: gtk::Application,
+    config: Arc<Mutex<AppConfig>>,
+    store: ConfigStore,
+    engine: EngineHandle,
+    args: &[String],
+    minimized: bool,
+) {
     let expanded = config.lock().ok().and_then(|config| config.active_profile.clone()).into_iter().collect();
     let context = UiContext {
         config,
@@ -69,14 +105,6 @@ pub fn run(config: Arc<Mutex<AppConfig>>, store: ConfigStore, engine: EngineHand
         }
     });
     let start_hidden = std::cell::Cell::new(minimized);
-    app.connect_startup(|_| {
-        // Installed builds find the icon in hicolor; source builds use data/.
-        #[cfg(debug_assertions)]
-        if let Some(display) = gtk::gdk::Display::default() {
-            gtk::IconTheme::for_display(&display).add_search_path(concat!(env!("CARGO_MANIFEST_DIR"), "/data"));
-        }
-        gtk::Window::set_default_icon_name(APP_ID);
-    });
     app.connect_activate(move |app| {
         if let Some(window) = app.active_window() {
             window.present();

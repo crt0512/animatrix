@@ -18,6 +18,11 @@ fn main() -> anyhow::Result<()> {
         return remote::run(command);
     }
 
+    // Only one animatrix may drive the panel; a second launch hands over.
+    let Some(app) = ui::claim(&args, !minimized.is_empty()) else {
+        return Ok(());
+    };
+
     let store = ConfigStore::discover()?;
     let config = store.load()?;
     store.save(&config)?;
@@ -28,7 +33,7 @@ fn main() -> anyhow::Result<()> {
     }
     let shared = Arc::new(Mutex::new(config));
     let engine = EngineHandle::start(Arc::clone(&shared));
-    ui::run(shared, store, engine, &args, !minimized.is_empty());
+    ui::run(app, shared, store, engine, &args, !minimized.is_empty());
     Ok(())
 }
 
